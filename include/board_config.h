@@ -38,6 +38,7 @@ static constexpr uint8_t PCF8574_WATER_INPUT_BIT = 0; // P0
 
 // Contatore ZENNER
 static constexpr float WATER_METER_PULSES_PER_LITER = 87.0f;
+static constexpr uint32_t WATER_METER_DEBOUNCE_MS = 20U;
 
 // Scheduling
 static constexpr uint32_t SENSOR_SAMPLE_PERIOD_MS   = 5000;
