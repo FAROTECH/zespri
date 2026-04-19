@@ -1,0 +1,36 @@
+#pragma once
+#include <Arduino.h>
+
+struct WaterMeterData {
+    uint32_t pulseCount = 0;
+    float liters = 0.0f;
+    bool lineState = true;           // true = idle/high
+    uint32_t lastPulseMs = 0;
+};
+
+struct EnvData {
+    bool sht30Present = false;
+    float temperatureC = NAN;
+    float humidityRH = NAN;
+    bool moisturePresent = false;    // sensore esterno non ancora definito
+    uint16_t moistureRaw = 0;
+};
+
+struct GpsData {
+    bool valid = false;
+    bool fix = false;
+    uint32_t satellites = 0;
+    double latitude = 0.0;
+    double longitude = 0.0;
+    double altitudeMeters = 0.0;
+    double hdop = 0.0;
+    uint32_t ageMs = 0;
+    char utc[21] = {0};              // YYYY-MM-DDTHH:MM:SSZ
+};
+
+struct DeviceSnapshot {
+    uint32_t uptimeMs = 0;
+    WaterMeterData water;
+    EnvData env;
+    GpsData gps;
+};
