@@ -4,10 +4,11 @@
 #include <SPI.h>
 #include <RadioLib.h>
 #include <LoRaWAN_ESP32.h>
+#include "lorawan_provisioning.h"
 
 class LoraService {
 public:
-    bool begin();
+    bool begin(const LorawanProvisioning& cfg);
     bool join();
     bool sendUplink(const uint8_t* data, size_t len, uint8_t fport = 1, bool confirmed = false);
 
@@ -26,6 +27,8 @@ private:
     Module* _module = nullptr;
     SX1262* _radio = nullptr;
     LoRaWANNode* _node = nullptr;
+
+    LorawanProvisioning _cfg{};
 
     bool _ready = false;
     bool _joined = false;

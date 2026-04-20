@@ -28,9 +28,19 @@ struct GpsData {
     char utc[21] = {0};              // YYYY-MM-DDTHH:MM:SSZ
 };
 
+struct BatteryData {
+    bool valid = false;
+    uint16_t millivolts = 0;
+    bool low = false;
+    bool critical = false;
+    bool solarPresent = false;
+    bool charging = false;
+};
+
 struct DeviceSnapshot {
     uint32_t uptimeMs = 0;
     WaterMeterData water;
     EnvData env;
     GpsData gps;
+    BatteryData battery;
 };

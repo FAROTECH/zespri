@@ -11,6 +11,6 @@ public:
 private:
     static void pushU8(std::vector<uint8_t>& out, uint8_t v);
     static void pushU16(std::vector<uint8_t>& out, uint16_t v);
+    static void pushI16(std::vector<uint8_t>& out, int16_t v);
     static void pushU32(std::vector<uint8_t>& out, uint32_t v);
-    static void pushI32(std::vector<uint8_t>& out, int32_t v);
 };

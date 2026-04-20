@@ -2,10 +2,11 @@
 #include "board_config.h"
 #include "lorawan_config.h"
 
-bool LoraService::begin() {
+bool LoraService::begin(const LorawanProvisioning& cfg) {
     _ready = false;
     _joined = false;
     _lastError = RADIOLIB_ERR_NONE;
+    _cfg = cfg;
 
     delete _node;   _node = nullptr;
     delete _radio;  _radio = nullptr;
@@ -36,7 +37,18 @@ bool LoraService::begin() {
         return false;
     }
 
-    _node = new LoRaWANNode(_radio, &EU868);
+    const LoRaWANBand_t* band = nullptr;
+    switch (_cfg.region) {
+        case LorawanRegion::EU868:
+            band = &EU868;
+            break;
+        default:
+            _lastError = -32020;
+            Serial.println("[LORAWAN] unsupported region");
+            return false;
+    }
+
+    _node = new LoRaWANNode(_radio, band);
     if (_node == nullptr) {
         _lastError = -32000;
         Serial.println("[LORAWAN] node alloc FAIL");
@@ -47,15 +59,15 @@ bool LoraService::begin() {
     uint64_t devEUI = 0;
 
     for (int i = 0; i < 8; i++) {
-        joinEUI = (joinEUI << 8) | LORAWAN_JOIN_EUI[i];
-        devEUI  = (devEUI  << 8) | LORAWAN_DEV_EUI[i];
+        joinEUI = (joinEUI << 8) | _cfg.joinEui[i];
+        devEUI  = (devEUI  << 8) | _cfg.devEui[i];
     }
 
     _lastError = _node->beginOTAA(
         joinEUI,
         devEUI,
         nullptr,
-        LORAWAN_APP_KEY
+        _cfg.appKey
     );
 
     if (_lastError != RADIOLIB_ERR_NONE) {
@@ -64,7 +76,6 @@ bool LoraService::begin() {
     }
 
     Serial.println("[LORAWAN] stack ready");
-
     _ready = true;
     return true;
 }
@@ -130,7 +141,7 @@ bool LoraService::join() {
         return false;
     }
 
-    // Prima prova a ripristinare una sessione valida già salvata.
+    // Prima provo a ripristinare una sessione valida già salvata.
     if (tryRestoreSession()) {
         return true;
     }
@@ -139,11 +150,19 @@ bool LoraService::join() {
 
     _lastError = _node->activateOTAA();
 
+    // Persisto SEMPRE dopo il tentativo di join,
+    // anche se fallisce, per non perdere lo stato/nonces.
+    bool persistOk = persistAfterJoinOrRestore();
+    Serial.printf(
+        "[LORAWAN] persist after join attempt: %s | joinErr=%d\n",
+        persistOk ? "OK" : "FAIL",
+        _lastError
+    );
+
     if ((_lastError == RADIOLIB_LORAWAN_NEW_SESSION) ||
         (_lastError == RADIOLIB_LORAWAN_SESSION_RESTORED)) {
         _joined = true;
         Serial.printf("[LORAWAN] join success state=%d\n", _lastError);
-        persistAfterJoinOrRestore();
         return true;
     }
 

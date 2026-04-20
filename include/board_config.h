@@ -58,3 +58,9 @@ static constexpr int8_t  LORA_TX_POWER_DBM = 14;
 
 static constexpr bool ENABLE_GPS = false;
 static constexpr bool ENABLE_EXTERNAL_MOISTURE_STUB = false;
+
+// Battery monitor
+static constexpr uint8_t PIN_BATTERY_ADC = 35;     // V_CHECK
+static constexpr float BATTERY_DIVIDER_RATIO = 2.0f; // R8=10k, R10=10k
+static constexpr uint16_t BATTERY_LOW_MV = 3600;
+static constexpr uint16_t BATTERY_CRITICAL_MV = 3400;
