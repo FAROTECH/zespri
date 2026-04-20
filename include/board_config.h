@@ -42,7 +42,6 @@ static constexpr uint32_t WATER_METER_DEBOUNCE_MS = 20U;
 
 // Scheduling
 static constexpr uint32_t SENSOR_SAMPLE_PERIOD_MS   = 5000;
-static constexpr uint32_t PAYLOAD_TX_PERIOD_MS      = 30000;
 static constexpr uint32_t WATER_POLL_PERIOD_MS      = 5;
 static constexpr uint32_t STATUS_LOG_PERIOD_MS      = 5000;
 

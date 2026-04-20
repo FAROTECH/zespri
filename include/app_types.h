@@ -8,12 +8,23 @@ struct WaterMeterData {
     uint32_t lastPulseMs = 0;
 };
 
+enum class MoistureState : uint8_t {
+    INVALID = 0,
+    DRY     = 1,
+    MOIST   = 2,
+    WET     = 3
+};
+
 struct EnvData {
     bool sht30Present = false;
     float temperatureC = NAN;
     float humidityRH = NAN;
-    bool moisturePresent = false;    // sensore esterno non ancora definito
+
+    bool moisturePresent = false;
     uint16_t moistureRaw = 0;
+
+    uint8_t moisturePct = 0xFF;              // 0..100, 0xFF = invalid/not available
+    MoistureState moistureState = MoistureState::INVALID;
 };
 
 struct GpsData {
@@ -25,7 +36,7 @@ struct GpsData {
     double altitudeMeters = 0.0;
     double hdop = 0.0;
     uint32_t ageMs = 0;
-    char utc[21] = {0};              // YYYY-MM-DDTHH:MM:SSZ
+    char utc[21] = {0};              // HH:MM:SS
 };
 
 struct BatteryData {

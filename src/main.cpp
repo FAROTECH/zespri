@@ -191,7 +191,7 @@ static BatteryData readBatteryData() {
     data.charging = true;
 
     // valore dimostrativo realistico
-    data.millivolts = 4060;
+    data.millivolts = 3890;
 
     data.low = (data.millivolts <= BATTERY_LOW_MV);
     data.critical = (data.millivolts <= BATTERY_CRITICAL_MV);
@@ -216,6 +216,16 @@ static DeviceSnapshot buildSnapshot() {
     snap.battery = readBatteryData();
 
     return snap;
+}
+
+static const char* moistureStateToString(MoistureState state) {
+    switch (state) {
+        case MoistureState::DRY:     return "DRY";
+        case MoistureState::MOIST:   return "MOIST";
+        case MoistureState::WET:     return "WET";
+        case MoistureState::INVALID: return "INVALID";
+        default:                     return "UNKNOWN";
+    }
 }
 
 static void printSnapshot(const DeviceSnapshot& s) {
@@ -246,7 +256,9 @@ static void printSnapshot(const DeviceSnapshot& s) {
 
     Serial.println(
         "MOIST  present=" + String(s.env.moisturePresent ? "YES" : "NO") +
-        " raw=" + String(s.env.moistureRaw)
+        " raw=" + String(s.env.moistureRaw) +
+        " pct=" + String(s.env.moisturePct == 0xFF ? -1 : (int)s.env.moisturePct) +
+        " state=" + String(moistureStateToString(s.env.moistureState))
     );
 
 #if ENABLE_GPS
@@ -292,7 +304,7 @@ static bool parseOnOff(const String& s, bool& value);
 
 void setup() {
     Serial.begin(115200);
-    delay(10000);
+    delay(5000);
 
     pinMode(PIN_BATTERY_ADC, INPUT);
     analogReadResolution(12);
