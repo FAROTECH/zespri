@@ -1,32 +1,17 @@
 #include "lora_service.h"
 #include "board_config.h"
-
-LoraService* LoraService::_instance = nullptr;
-
-void LoraService::onPacketSentThunk() {
-    if (_instance != nullptr) {
-        _instance->onPacketSent();
-    }
-}
-
-void LoraService::onPacketSent() {
-    _packetSent = true;
-}
+#include "lorawan_config.h"
 
 bool LoraService::begin() {
     _ready = false;
+    _joined = false;
     _lastError = RADIOLIB_ERR_NONE;
-    _packetSent = false;
 
-    if (_radio != nullptr) {
-        delete _radio;
-        _radio = nullptr;
-    }
+    delete _node;   _node = nullptr;
+    delete _radio;  _radio = nullptr;
+    delete _module; _module = nullptr;
 
-    if (_module != nullptr) {
-        delete _module;
-        _module = nullptr;
-    }
+    Serial.println("[LORAWAN] radio begin...");
 
     if (PIN_LORA_RXEN >= 0) {
         pinMode(PIN_LORA_RXEN, OUTPUT);
@@ -45,59 +30,174 @@ bool LoraService::begin() {
 
     _radio = new SX1262(_module);
 
-    _lastError = _radio->begin(
-        LORA_FREQUENCY_MHZ,
-        LORA_BANDWIDTH_KHZ,
-        LORA_SPREADING_FACTOR,
-        LORA_CODING_RATE,
-        LORA_SYNC_WORD,
-        LORA_TX_POWER_DBM
-    );
-
+    _lastError = _radio->begin();
     if (_lastError != RADIOLIB_ERR_NONE) {
-        _ready = false;
+        Serial.printf("[LORAWAN] radio begin FAIL err=%d\n", _lastError);
         return false;
     }
 
-    _instance = this;
-    _radio->setPacketSentAction(onPacketSentThunk);
+    _node = new LoRaWANNode(_radio, &EU868);
+    if (_node == nullptr) {
+        _lastError = -32000;
+        Serial.println("[LORAWAN] node alloc FAIL");
+        return false;
+    }
+
+    uint64_t joinEUI = 0;
+    uint64_t devEUI = 0;
+
+    for (int i = 0; i < 8; i++) {
+        joinEUI = (joinEUI << 8) | LORAWAN_JOIN_EUI[i];
+        devEUI  = (devEUI  << 8) | LORAWAN_DEV_EUI[i];
+    }
+
+    _lastError = _node->beginOTAA(
+        joinEUI,
+        devEUI,
+        nullptr,
+        LORAWAN_APP_KEY
+    );
+
+    if (_lastError != RADIOLIB_ERR_NONE) {
+        Serial.printf("[LORAWAN] beginOTAA FAIL err=%d\n", _lastError);
+        return false;
+    }
+
+    Serial.println("[LORAWAN] stack ready");
 
     _ready = true;
     return true;
 }
 
-bool LoraService::send(const uint8_t* data, size_t len) {
-    if (!_ready || _radio == nullptr || data == nullptr || len == 0) {
-        _lastError = ERR_NOT_READY_OR_INVALID_ARGS;
+bool LoraService::tryRestoreSession() {
+    if (_node == nullptr) {
+        _lastError = -32010;
         return false;
     }
 
-    _packetSent = false;
+    bool restored = persist.loadSession(_node);
 
-    _lastError = _radio->startTransmit(data, len);
-    if (_lastError != RADIOLIB_ERR_NONE) {
-        _radio->finishTransmit();
+    if (restored) {
+        _joined = true;
+        _lastError = RADIOLIB_ERR_NONE;
+        Serial.println("[LORAWAN] session restore OK");
+        return true;
+    }
+
+    _joined = false;
+    _lastError = -32013;
+    Serial.println("[LORAWAN] no restorable session, OTAA required");
+    return false;
+}
+
+bool LoraService::persistAfterJoinOrRestore() {
+    if (_node == nullptr) {
+        _lastError = -32011;
         return false;
     }
 
-    const uint32_t t0 = millis();
-    while (!_packetSent && (millis() - t0) < TX_TIMEOUT_MS) {
-        delay(1);
+    bool saved = persist.saveSession(_node);
+    if (saved) {
+        Serial.println("[LORAWAN] session persisted");
+        return true;
     }
 
-    _radio->finishTransmit();
+    _lastError = -32014;
+    Serial.println("[LORAWAN] session persist FAIL");
+    return false;
+}
 
-    if (!_packetSent) {
-        _lastError = RADIOLIB_ERR_TX_TIMEOUT;
+bool LoraService::persistAfterUplink() {
+    if (_node == nullptr) {
+        _lastError = -32012;
         return false;
     }
 
-    _lastError = RADIOLIB_ERR_NONE;
-    return true;
+    bool saved = persist.saveSession(_node);
+    if (saved) {
+        Serial.println("[LORAWAN] session updated");
+        return true;
+    }
+
+    _lastError = -32015;
+    Serial.println("[LORAWAN] session update FAIL");
+    return false;
+}
+
+bool LoraService::join() {
+    if (!_ready || _node == nullptr) {
+        _lastError = -32001;
+        return false;
+    }
+
+    // Prima prova a ripristinare una sessione valida già salvata.
+    if (tryRestoreSession()) {
+        return true;
+    }
+
+    Serial.println("[LORAWAN] join start");
+
+    _lastError = _node->activateOTAA();
+
+    if ((_lastError == RADIOLIB_LORAWAN_NEW_SESSION) ||
+        (_lastError == RADIOLIB_LORAWAN_SESSION_RESTORED)) {
+        _joined = true;
+        Serial.printf("[LORAWAN] join success state=%d\n", _lastError);
+        persistAfterJoinOrRestore();
+        return true;
+    }
+
+    _joined = false;
+    Serial.printf("[LORAWAN] join fail err=%d\n", _lastError);
+    return false;
+}
+
+bool LoraService::sendUplink(const uint8_t* data,
+                             size_t len,
+                             uint8_t fport,
+                             bool confirmed) {
+    if (!_joined) {
+        _lastError = -32002;
+        Serial.println("[LORAWAN] uplink blocked: node not joined");
+        return false;
+    }
+
+    if (_node == nullptr || data == nullptr || len == 0) {
+        _lastError = -32003;
+        Serial.printf("[LORAWAN] uplink FAIL precheck err=%d\n", _lastError);
+        return false;
+    }
+
+    Serial.printf("[LORAWAN] uplink start port=%u bytes=%u confirmed=%s\n",
+                  fport,
+                  (unsigned)len,
+                  confirmed ? "YES" : "NO");
+
+    int16_t downlinkLen = _node->sendReceive(
+        data,
+        len,
+        fport,
+        confirmed
+    );
+
+    if (downlinkLen >= 0) {
+        _lastError = RADIOLIB_ERR_NONE;
+        Serial.printf("[LORAWAN] uplink ok downlinkWin=%d\n", downlinkLen);
+        persistAfterUplink();
+        return true;
+    }
+
+    _lastError = downlinkLen;
+    Serial.printf("[LORAWAN] uplink FAIL err=%d\n", _lastError);
+    return false;
 }
 
 bool LoraService::isReady() const {
     return _ready;
+}
+
+bool LoraService::isJoined() const {
+    return _joined;
 }
 
 int LoraService::getLastError() const {

@@ -2,13 +2,7 @@
 
 #include <Arduino.h>
 #include <Wire.h>
-
-struct WaterMeterData {
-    uint32_t pulseCount = 0U;
-    uint32_t lastPulseMs = 0U;
-    bool lineState = true;   // open collector con pull-up: idle HIGH
-    float liters = 0.0f;
-};
+#include "app_types.h"
 
 class PulseCounterPcf8574 {
 public:
