@@ -314,11 +314,11 @@ void setup() {
     Serial.println("Booting...");
 
     if (!LorawanProvisioningStore::load(g_lwCfg)) {
-        Serial.println("[LORAWAN] provisioning load FAIL -> using factory defaults");
+        Serial.println("CFG  : DEFAULT");
         g_lwCfg = LorawanProvisioningStore::makeFactoryDefault();
         LorawanProvisioningStore::save(g_lwCfg);
     } else {
-        Serial.println("[LORAWAN] provisioning load OK");
+        Serial.println("CFG  : OK");
     }
 
     LorawanProvisioningStore::print(g_lwCfg, Serial);
@@ -339,15 +339,11 @@ void setup() {
     Wire.setClock(100000);
     Wire.setTimeOut(50);
 
-    scanI2CBus();
-
     g_pcfPresent = g_waterCounter.begin(Wire, I2C_ADDR_PCF8574, PCF8574_WATER_INPUT_BIT);
-    Serial.printf("PCF8574 water counter: %s (addr 0x%02X)\n",
-                  g_pcfPresent ? "OK" : "NOT FOUND",
-                  I2C_ADDR_PCF8574);
+    Serial.printf("WATER: %s\n", g_pcfPresent ? "OK" : "FAIL");
 
-    g_env.begin(Wire);
-    Serial.println("Env service initialized");
+    bool envOk = g_env.begin(Wire);
+    Serial.printf("ENV  : %s\n", envOk ? "OK" : "FAIL");
 
 #if ENABLE_GPS
     g_gps.begin(GpsSerial, GPS_BAUDRATE, PIN_GPS_RX, PIN_GPS_TX);
@@ -355,26 +351,21 @@ void setup() {
 #endif
 
     if (!ZENNER_TEST_MODE && !MOISTURE_TEST_MODE) {
-        bool loraOk = g_lora.begin(g_lwCfg);
-        Serial.printf(
-            "LoRaWAN stack: %s | err=%d\n",
-            loraOk ? "OK" : "INIT FAILED",
-            g_lora.getLastError()
-        );
+        if (!g_lwCfg.txEnable) {
+            Serial.println("LORA : TX DISABLED");
+        } else {
+            bool loraOk = g_lora.begin(g_lwCfg);
 
-        if (loraOk) {
-            bool joinOk = g_lora.join();
+            if (!loraOk) {
+                Serial.printf("LORA : INIT FAIL (%d)\n", g_lora.getLastError());
+            } else {
+                bool joinOk = g_lora.join();
 
-            Serial.printf(
-                "LoRaWAN join: %s\n",
-                joinOk ? "OK" : "FAIL"
-            );
-
-            if (!joinOk) {
-                Serial.printf(
-                    "LoRaWAN join error: %d\n",
-                    g_lora.getLastError()
-                );
+                if (joinOk) {
+                    Serial.println("LORA : OK");
+                } else {
+                    Serial.printf("LORA : JOIN FAIL (%d)\n", g_lora.getLastError());
+                }
             }
         }
     }
@@ -386,6 +377,8 @@ void setup() {
         g_moisturePaused = false;
     }
 
+    Serial.println("System ready");
+    Serial.println();
     Serial.println();
 }
 
@@ -465,8 +458,8 @@ void loop() {
         printSnapshot(snap);
 
         std::vector<uint8_t> payload = PayloadBuilder::buildBinary(snap);
-        Serial.print("Payload HEX: ");
-        Serial.println(PayloadBuilder::toHex(payload));
+        //Serial.print("Payload HEX: ");
+        //Serial.println(PayloadBuilder::toHex(payload));
     }
 
     if (!ZENNER_TEST_MODE &&
@@ -537,6 +530,11 @@ static void handleLorawanSerial() {
     String line = Serial.readStringUntil('\n');
     line.trim();
     if (line.length() == 0) {
+        return;
+    }
+
+    if (line == "i2c scan") {
+        scanI2CBus();
         return;
     }
 

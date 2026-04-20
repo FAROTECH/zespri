@@ -41,9 +41,9 @@ static constexpr float WATER_METER_PULSES_PER_LITER = 87.0f;
 static constexpr uint32_t WATER_METER_DEBOUNCE_MS = 20U;
 
 // Scheduling
-static constexpr uint32_t SENSOR_SAMPLE_PERIOD_MS   = 5000;
+static constexpr uint32_t SENSOR_SAMPLE_PERIOD_MS   = 60000;
 static constexpr uint32_t WATER_POLL_PERIOD_MS      = 5;
-static constexpr uint32_t STATUS_LOG_PERIOD_MS      = 5000;
+static constexpr uint32_t STATUS_LOG_PERIOD_MS      = 60000;
 
 // LoRa raw baseline
 // NOTA: ChirpStack richiede LoRaWAN, non LoRa raw.

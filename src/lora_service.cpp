@@ -12,8 +12,6 @@ bool LoraService::begin(const LorawanProvisioning& cfg) {
     delete _radio;  _radio = nullptr;
     delete _module; _module = nullptr;
 
-    Serial.println("[LORAWAN] radio begin...");
-
     if (PIN_LORA_RXEN >= 0) {
         pinMode(PIN_LORA_RXEN, OUTPUT);
         digitalWrite(PIN_LORA_RXEN, HIGH);
@@ -75,7 +73,6 @@ bool LoraService::begin(const LorawanProvisioning& cfg) {
         return false;
     }
 
-    Serial.println("[LORAWAN] stack ready");
     _ready = true;
     return true;
 }
@@ -91,13 +88,11 @@ bool LoraService::tryRestoreSession() {
     if (restored) {
         _joined = true;
         _lastError = RADIOLIB_ERR_NONE;
-        Serial.println("[LORAWAN] session restore OK");
         return true;
     }
 
     _joined = false;
     _lastError = -32013;
-    Serial.println("[LORAWAN] no restorable session, OTAA required");
     return false;
 }
 
@@ -109,7 +104,6 @@ bool LoraService::persistAfterJoinOrRestore() {
 
     bool saved = persist.saveSession(_node);
     if (saved) {
-        Serial.println("[LORAWAN] session persisted");
         return true;
     }
 
@@ -126,7 +120,6 @@ bool LoraService::persistAfterUplink() {
 
     bool saved = persist.saveSession(_node);
     if (saved) {
-        Serial.println("[LORAWAN] session updated");
         return true;
     }
 
@@ -146,28 +139,19 @@ bool LoraService::join() {
         return true;
     }
 
-    Serial.println("[LORAWAN] join start");
-
     _lastError = _node->activateOTAA();
 
     // Persisto SEMPRE dopo il tentativo di join,
     // anche se fallisce, per non perdere lo stato/nonces.
     bool persistOk = persistAfterJoinOrRestore();
-    Serial.printf(
-        "[LORAWAN] persist after join attempt: %s | joinErr=%d\n",
-        persistOk ? "OK" : "FAIL",
-        _lastError
-    );
 
     if ((_lastError == RADIOLIB_LORAWAN_NEW_SESSION) ||
         (_lastError == RADIOLIB_LORAWAN_SESSION_RESTORED)) {
         _joined = true;
-        Serial.printf("[LORAWAN] join success state=%d\n", _lastError);
         return true;
     }
 
     _joined = false;
-    Serial.printf("[LORAWAN] join fail err=%d\n", _lastError);
     return false;
 }
 
@@ -187,11 +171,6 @@ bool LoraService::sendUplink(const uint8_t* data,
         return false;
     }
 
-    Serial.printf("[LORAWAN] uplink start port=%u bytes=%u confirmed=%s\n",
-                  fport,
-                  (unsigned)len,
-                  confirmed ? "YES" : "NO");
-
     int16_t downlinkLen = _node->sendReceive(
         data,
         len,
@@ -201,7 +180,6 @@ bool LoraService::sendUplink(const uint8_t* data,
 
     if (downlinkLen >= 0) {
         _lastError = RADIOLIB_ERR_NONE;
-        Serial.printf("[LORAWAN] uplink ok downlinkWin=%d\n", downlinkLen);
         persistAfterUplink();
         return true;
     }
