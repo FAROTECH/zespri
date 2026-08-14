@@ -7,205 +7,150 @@
 #include "pulse_counter.h"
 #include "env_service.h"
 #include "payload_builder.h"
+
+#if ENABLE_LORAWAN
 #include "lora_service.h"
 #include "lorawan_config.h"
 #include "lorawan_provisioning.h"
-
-static LorawanProvisioning g_lwCfg;
+#endif
 
 #if ENABLE_GPS
 #include "gps_service.h"
+#endif
+
+
+// -----------------------------------------------------------------------------
+// Services
+// -----------------------------------------------------------------------------
+
+static PulseCounterPcf8574 g_waterCounter;
+static EnvService g_env;
+
+#if ENABLE_LORAWAN
+static LoraService g_lora;
+static LorawanProvisioning g_lwCfg;
+#endif
+
+#if ENABLE_GPS
 static HardwareSerial GpsSerial(1);
 static GpsService g_gps;
 #endif
 
-static PulseCounterPcf8574 g_waterCounter;
-static EnvService g_env;
-static LoraService g_lora;
 
-static bool g_pcfPresent = false;
+// -----------------------------------------------------------------------------
+// Runtime state
+// -----------------------------------------------------------------------------
+
+static bool g_waterAvailable = false;
+
 static uint32_t g_lastWaterPollMs = 0;
 static uint32_t g_lastEnvSampleMs = 0;
+static uint32_t g_lastStatusMs = 0;
+
+#if ENABLE_LORAWAN
 static uint32_t g_lastTxMs = 0;
-static uint32_t g_lastLogMs = 0;
+#endif
 
-// Modalità test
-static constexpr bool ZENNER_TEST_MODE = false;
-static constexpr bool MOISTURE_TEST_MODE = false;
-
-// Stato storico per log ZENNER
 static uint32_t g_lastLoggedPulseCount = 0;
 static float g_lastLoggedLiters = 0.0f;
 
-// -----------------------------
-// Moisture test mode
-// -----------------------------
-enum class MoisturePhase : uint8_t {
-    AIR = 0,
-    DRY = 1,
-    WET = 2,
-    WATER = 3
-};
 
-static MoisturePhase g_moisturePhase = MoisturePhase::AIR;
-static bool g_moisturePaused = false;
+// -----------------------------------------------------------------------------
+// Utility
+// -----------------------------------------------------------------------------
 
-// Finestra statistica per log CSV
-static uint32_t g_moistureAccum = 0;
-static uint16_t g_moistureSamples = 0;
-static uint16_t g_moistureMin = 0xFFFF;
-static uint16_t g_moistureMax = 0;
-static uint32_t g_lastMoistureCsvMs = 0;
+static const char* moistureStateToString(MoistureState state)
+{
+    switch (state) {
+        case MoistureState::DRY:
+            return "DRY";
 
-static const char* moisturePhaseToString(MoisturePhase phase) {
-    switch (phase) {
-        case MoisturePhase::AIR:   return "AIR";
-        case MoisturePhase::DRY:   return "DRY";
-        case MoisturePhase::WET:   return "WET";
-        case MoisturePhase::WATER: return "WATER";
-        default:                   return "UNKNOWN";
+        case MoistureState::MOIST:
+            return "MOIST";
+
+        case MoistureState::WET:
+            return "WET";
+
+        case MoistureState::INVALID:
+        default:
+            return "INVALID";
     }
 }
 
-static void resetMoistureWindow() {
-    g_moistureAccum = 0;
-    g_moistureSamples = 0;
-    g_moistureMin = 0xFFFF;
-    g_moistureMax = 0;
-}
 
-static void setMoisturePhase(MoisturePhase phase) {
-    g_moisturePhase = phase;
-    resetMoistureWindow();
+// -----------------------------------------------------------------------------
+// I2C diagnostics
+// -----------------------------------------------------------------------------
 
-    Serial.print("# PHASE=");
-    Serial.println(moisturePhaseToString(g_moisturePhase));
-}
-
-static void printMoistureTestHelp() {
-    Serial.println("# Moisture test commands:");
-    Serial.println("#   a -> phase AIR");
-    Serial.println("#   d -> phase DRY");
-    Serial.println("#   w -> phase WET");
-    Serial.println("#   x -> phase WATER");
-    Serial.println("#   p -> pause logging");
-    Serial.println("#   s -> resume logging");
-    Serial.println("#   r -> reset current averaging window");
-    Serial.println("#   h -> help");
-    Serial.println("# CSV columns:");
-    Serial.println("# ts_ms,phase,raw,avg,min,max,samples");
-}
-
-static void handleMoistureTestSerial() {
-    while (Serial.available() > 0) {
-        const char c = (char)Serial.read();
-
-        if (c == '\n' || c == '\r') {
-            continue;
-        }
-
-        switch (c) {
-            case 'a':
-            case 'A':
-                setMoisturePhase(MoisturePhase::AIR);
-                break;
-
-            case 'd':
-            case 'D':
-                setMoisturePhase(MoisturePhase::DRY);
-                break;
-
-            case 'w':
-            case 'W':
-                setMoisturePhase(MoisturePhase::WET);
-                break;
-
-            case 'x':
-            case 'X':
-                setMoisturePhase(MoisturePhase::WATER);
-                break;
-
-            case 'p':
-            case 'P':
-                g_moisturePaused = true;
-                Serial.println("# PAUSED");
-                break;
-
-            case 's':
-            case 'S':
-                g_moisturePaused = false;
-                resetMoistureWindow();
-                Serial.println("# RESUMED");
-                break;
-
-            case 'r':
-            case 'R':
-                resetMoistureWindow();
-                Serial.println("# WINDOW RESET");
-                break;
-
-            case 'h':
-            case 'H':
-            case '?':
-                printMoistureTestHelp();
-                break;
-
-            default:
-                Serial.print("# UNKNOWN CMD=");
-                Serial.println(c);
-                break;
-        }
-    }
-}
-
-static void scanI2CBus() {
+static void scanI2CBus()
+{
     Serial.println();
     Serial.println("I2C scan start");
 
-    for (uint8_t addr = 1; addr < 127; addr++) {
+    uint8_t count = 0;
+
+    for (uint8_t addr = 1; addr < 127; ++addr) {
+
         Wire.beginTransmission(addr);
-        uint8_t err = Wire.endTransmission(true);
+
+        const uint8_t err =
+            Wire.endTransmission(true);
 
         if (err == 0) {
-            Serial.print(" - found device at 0x");
-            if (addr < 16) Serial.print('0');
+
+            Serial.print("Found device at 0x");
+
+            if (addr < 0x10) {
+                Serial.print('0');
+            }
+
             Serial.println(addr, HEX);
-        } else if (err == 4) {
-            Serial.print(" - unknown error at 0x");
-            if (addr < 16) Serial.print('0');
-            Serial.println(addr, HEX);
+            ++count;
         }
     }
 
+    Serial.printf("Total devices: %u\n", count);
     Serial.println("I2C scan end");
     Serial.println();
 }
 
-static BatteryData readBatteryData() {
+
+// -----------------------------------------------------------------------------
+// Battery
+// -----------------------------------------------------------------------------
+
+static BatteryData readBatteryData()
+{
     BatteryData data;
 
-    data.valid = true;
-
-    // DEMO POWER TELEMETRY
-    data.solarPresent = true;
-    data.charging = true;
-
-    // valore dimostrativo realistico
-    data.millivolts = 3890;
-
-    data.low = (data.millivolts <= BATTERY_LOW_MV);
-    data.critical = (data.millivolts <= BATTERY_CRITICAL_MV);
+    /*
+     * Battery acquisition is NOT yet validated.
+     *
+     * Do not emit fabricated telemetry.
+     */
+    data.valid = false;
+    data.millivolts = 0;
+    data.low = false;
+    data.critical = false;
+    data.solarPresent = false;
+    data.charging = false;
 
     return data;
 }
 
-static DeviceSnapshot buildSnapshot() {
+
+// -----------------------------------------------------------------------------
+// Snapshot
+// -----------------------------------------------------------------------------
+
+static DeviceSnapshot buildSnapshot()
+{
     DeviceSnapshot snap;
 
     snap.uptimeMs = millis();
 
     snap.water = g_waterCounter.getData();
-    snap.env   = g_env.getData();
+    snap.env = g_env.getData();
 
 #if ENABLE_GPS
     snap.gps = g_gps.getData();
@@ -218,443 +163,430 @@ static DeviceSnapshot buildSnapshot() {
     return snap;
 }
 
-static const char* moistureStateToString(MoistureState state) {
-    switch (state) {
-        case MoistureState::DRY:     return "DRY";
-        case MoistureState::MOIST:   return "MOIST";
-        case MoistureState::WET:     return "WET";
-        case MoistureState::INVALID: return "INVALID";
-        default:                     return "UNKNOWN";
-    }
-}
 
-static void printSnapshot(const DeviceSnapshot& s) {
+// -----------------------------------------------------------------------------
+// Status output
+// -----------------------------------------------------------------------------
+
+static void printSnapshot(const DeviceSnapshot& s)
+{
     Serial.println("===== ANDROMEDA STATUS =====");
 
-    Serial.println("Uptime: " + String(s.uptimeMs) + " ms");
-
-    Serial.println(
-        "WATER  pulses=" + String(s.water.pulseCount) +
-        " liters=" + String(s.water.liters, 3) +
-        " line=" + String(s.water.lineState ? "HIGH" : "LOW") +
-        " lastPulseMs=" + String(s.water.lastPulseMs)
+    Serial.printf(
+        "UPTIME %lu ms\n",
+        static_cast<unsigned long>(s.uptimeMs)
     );
 
-    const uint32_t pulseDelta = s.water.pulseCount - g_lastLoggedPulseCount;
-    const float literDelta = s.water.liters - g_lastLoggedLiters;
+    if (g_waterAvailable) {
 
-    Serial.println(
-        "WATERD pulses=" + String(pulseDelta) +
-        " liters=" + String(literDelta, 3)
-    );
+        Serial.printf(
+            "WATER  pulses=%lu liters=%.3f line=%s lastPulseMs=%lu\n",
+            static_cast<unsigned long>(s.water.pulseCount),
+            s.water.liters,
+            s.water.lineState ? "HIGH" : "LOW",
+            static_cast<unsigned long>(s.water.lastPulseMs)
+        );
 
-    Serial.println(
-        "SHT30  present=" + String(s.env.sht30Present ? "YES" : "NO") +
-        " temp=" + String(s.env.temperatureC, 2) +
-        " C hum=" + String(s.env.humidityRH, 2) + " %RH"
-    );
+        const uint32_t pulseDelta =
+            s.water.pulseCount - g_lastLoggedPulseCount;
 
-    Serial.println(
-        "MOIST  present=" + String(s.env.moisturePresent ? "YES" : "NO") +
-        " raw=" + String(s.env.moistureRaw) +
-        " pct=" + String(s.env.moisturePct == 0xFF ? -1 : (int)s.env.moisturePct) +
-        " state=" + String(moistureStateToString(s.env.moistureState))
-    );
+        const float literDelta =
+            s.water.liters - g_lastLoggedLiters;
 
-#if ENABLE_GPS
-    Serial.println(
-        "GPS    fix=" + String(s.gps.fix ? "YES" : "NO") +
-        " sats=" + String(s.gps.satellites) +
-        " lat=" + String(s.gps.latitude, 7) +
-        " lon=" + String(s.gps.longitude, 7) +
-        " alt=" + String(s.gps.altitudeMeters, 2) +
-        " hdop=" + String(s.gps.hdop, 2) +
-        " utc=" + String(s.gps.utc[0] ? s.gps.utc : "N/A") +
-        " age=" + String(s.gps.ageMs) + " ms"
-    );
+        Serial.printf(
+            "WATERD pulses=%lu liters=%.3f\n",
+            static_cast<unsigned long>(pulseDelta),
+            literDelta
+        );
 
-    if (g_gps.getLastByteMs() == 0) {
-        Serial.println("GPSDBG rxBytes=" + String(g_gps.getRxBytes()) + " lastByteAgo=NEVER");
     } else {
-        Serial.println(
-            "GPSDBG rxBytes=" + String(g_gps.getRxBytes()) +
-            " lastByteAgo=" + String(millis() - g_gps.getLastByteMs()) + " ms"
+
+        Serial.println("WATER  INVALID");
+    }
+
+    // -------------------------------------------------------------------------
+    // Temperature / humidity
+    // -------------------------------------------------------------------------
+
+    if (!s.env.sht30Present) {
+
+        Serial.println("SHT    NOT PRESENT");
+
+    } else {
+
+        Serial.print("SHT    ");
+
+        if (isnan(s.env.temperatureC)) {
+            Serial.print("temp=INVALID");
+        } else {
+            Serial.printf("temp=%.2f C", s.env.temperatureC);
+        }
+
+        Serial.print(" ");
+
+        if (isnan(s.env.humidityRH)) {
+            Serial.print("hum=INVALID");
+        } else {
+            Serial.printf("hum=%.2f %%RH", s.env.humidityRH);
+        }
+
+        Serial.println();
+    }
+
+    // -------------------------------------------------------------------------
+    // Soil moisture
+    // -------------------------------------------------------------------------
+
+    if (!s.env.moisturePresent ||
+        s.env.moistureRaw == 0xFFFFU) {
+
+        Serial.println("MOIST  INVALID");
+
+    } else {
+
+        Serial.printf(
+            "MOIST  raw=%u pct=%d state=%s\n",
+            s.env.moistureRaw,
+            s.env.moisturePct == 0xFF
+                ? -1
+                : static_cast<int>(s.env.moisturePct),
+            moistureStateToString(s.env.moistureState)
         );
     }
-#endif
 
-    Serial.println(
-        "BATT   valid=" + String(s.battery.valid ? "YES" : "NO") +
-        " mv=" + String(s.battery.millivolts) +
-        " low=" + String(s.battery.low ? "YES" : "NO") +
-        " critical=" + String(s.battery.critical ? "YES" : "NO") +
-        " solar=" + String(s.battery.solarPresent ? "YES" : "NO") +
-        " charging=" + String(s.battery.charging ? "YES" : "NO")
+#if ENABLE_GPS
+
+    Serial.printf(
+        "GPS    fix=%s sats=%lu lat=%.7f lon=%.7f alt=%.2f hdop=%.2f\n",
+        s.gps.fix ? "YES" : "NO",
+        static_cast<unsigned long>(s.gps.satellites),
+        s.gps.latitude,
+        s.gps.longitude,
+        s.gps.altitudeMeters,
+        s.gps.hdop
     );
 
+#endif
+
+    // -------------------------------------------------------------------------
+    // Battery
+    // -------------------------------------------------------------------------
+
+    if (s.battery.valid) {
+
+        Serial.printf(
+            "BATT   mv=%u low=%s critical=%s solar=%s charging=%s\n",
+            s.battery.millivolts,
+            s.battery.low ? "YES" : "NO",
+            s.battery.critical ? "YES" : "NO",
+            s.battery.solarPresent ? "YES" : "NO",
+            s.battery.charging ? "YES" : "NO"
+        );
+
+    } else {
+
+        Serial.println("BATT   INVALID / NOT IMPLEMENTED");
+    }
+
+    // -------------------------------------------------------------------------
+    // Local payload verification
+    // -------------------------------------------------------------------------
+
+    const std::vector<uint8_t> payload =
+        PayloadBuilder::buildBinary(s);
+
+    Serial.print("PAYLOAD v4 HEX=");
+    Serial.println(PayloadBuilder::toHex(payload));
+
+#if ENABLE_LORAWAN
+    Serial.println("LORA   ENABLED");
+#else
+    Serial.println("LORA   DISABLED");
+#endif
+
     Serial.println("============================");
+    Serial.println();
 
     g_lastLoggedPulseCount = s.water.pulseCount;
     g_lastLoggedLiters = s.water.liters;
 }
 
-static void printLorawanHelp();
-static void handleLorawanSerial();
-static bool parseOnOff(const String& s, bool& value);
 
-void setup() {
+// -----------------------------------------------------------------------------
+// Serial command processing
+// -----------------------------------------------------------------------------
+//
+// Non-blocking: important because the water meter is polled every 5 ms.
+//
+
+static void processCommand(const String& command)
+{
+    if (command == "i2c scan") {
+
+        scanI2CBus();
+        return;
+    }
+
+    if (command == "status") {
+
+        printSnapshot(buildSnapshot());
+        return;
+    }
+
+    if (command == "reboot") {
+
+        Serial.println("Rebooting...");
+        delay(100);
+        ESP.restart();
+        return;
+    }
+
+    if (command == "help") {
+
+        Serial.println("Commands:");
+        Serial.println("  status");
+        Serial.println("  i2c scan");
+        Serial.println("  reboot");
+
+#if ENABLE_LORAWAN
+        Serial.println("  LoRaWAN commands enabled");
+#endif
+
+        return;
+    }
+
+    Serial.println("Unknown command");
+}
+
+
+static void handleSerial()
+{
+    static String line;
+
+    while (Serial.available() > 0) {
+
+        const char c =
+            static_cast<char>(Serial.read());
+
+        if (c == '\r') {
+            continue;
+        }
+
+        if (c == '\n') {
+
+            line.trim();
+
+            if (!line.isEmpty()) {
+                processCommand(line);
+            }
+
+            line = "";
+            continue;
+        }
+
+        /*
+         * Bound input length so malformed serial traffic
+         * cannot grow String indefinitely.
+         */
+        if (line.length() < 80) {
+            line += c;
+        }
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// Setup
+// -----------------------------------------------------------------------------
+
+void setup()
+{
     Serial.begin(115200);
-    delay(5000);
 
-    pinMode(PIN_BATTERY_ADC, INPUT);
-    analogReadResolution(12);
+    delay(1500);
 
     Serial.println();
     Serial.println("ANDROMEDA @ ZESPRI");
     Serial.println("Booting...");
 
-    if (!LorawanProvisioningStore::load(g_lwCfg)) {
-        Serial.println("CFG  : DEFAULT");
-        g_lwCfg = LorawanProvisioningStore::makeFactoryDefault();
-        LorawanProvisioningStore::save(g_lwCfg);
-    } else {
-        Serial.println("CFG  : OK");
-    }
-
-    LorawanProvisioningStore::print(g_lwCfg, Serial);
-    printLorawanHelp();
-
-
-    if (ZENNER_TEST_MODE) {
-        Serial.println("MODE: ZENNER TEST");
-        Serial.println("Radio TX temporarily disabled");
-    }
-
-    if (MOISTURE_TEST_MODE) {
-        Serial.println("MODE: MOISTURE TEST");
-        Serial.println("Normal telemetry and radio TX temporarily disabled");
-    }
-
-    Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-    Wire.setClock(100000);
-    Wire.setTimeOut(50);
-
-    g_pcfPresent = g_waterCounter.begin(Wire, I2C_ADDR_PCF8574, PCF8574_WATER_INPUT_BIT);
-    Serial.printf("WATER: %s\n", g_pcfPresent ? "OK" : "FAIL");
-
-    bool envOk = g_env.begin(Wire);
-    Serial.printf("ENV  : %s\n", envOk ? "OK" : "FAIL");
-
-#if ENABLE_GPS
-    g_gps.begin(GpsSerial, GPS_BAUDRATE, PIN_GPS_RX, PIN_GPS_TX);
-    Serial.println("GPS UART initialized");
+#if ENABLE_LORAWAN
+    Serial.println("BUILD : LORAWAN ENABLED");
+#else
+    Serial.println("BUILD : LOCAL TELEMETRY ONLY");
 #endif
 
-    if (!ZENNER_TEST_MODE && !MOISTURE_TEST_MODE) {
-        if (!g_lwCfg.txEnable) {
-            Serial.println("LORA : TX DISABLED");
-        } else {
-            bool loraOk = g_lora.begin(g_lwCfg);
+    // -------------------------------------------------------------------------
+    // I2C
+    // -------------------------------------------------------------------------
 
-            if (!loraOk) {
-                Serial.printf("LORA : INIT FAIL (%d)\n", g_lora.getLastError());
-            } else {
-                bool joinOk = g_lora.join();
+    pinMode(PIN_I2C_SDA, INPUT_PULLUP);
+    pinMode(PIN_I2C_SCL, INPUT_PULLUP);
 
-                if (joinOk) {
-                    Serial.println("LORA : OK");
-                } else {
-                    Serial.printf("LORA : JOIN FAIL (%d)\n", g_lora.getLastError());
-                }
-            }
-        }
-    }
+    Serial.printf(
+        "I2C lines before init: SDA=%d SCL=%d\n",
+        digitalRead(PIN_I2C_SDA),
+        digitalRead(PIN_I2C_SCL)
+    );
 
-    if (MOISTURE_TEST_MODE) {
-        printMoistureTestHelp();
-        Serial.println("# ts_ms,phase,raw,avg,min,max,samples");
-        setMoisturePhase(MoisturePhase::AIR);
-        g_moisturePaused = false;
-    }
+    Wire.begin(
+        PIN_I2C_SDA,
+        PIN_I2C_SCL
+    );
 
+    Wire.setClock(I2C_FREQUENCY_HZ);
+    Wire.setTimeOut(I2C_TIMEOUT_MS);
+
+    Serial.printf(
+        "I2C lines after init : SDA=%d SCL=%d\n",
+        digitalRead(PIN_I2C_SDA),
+        digitalRead(PIN_I2C_SCL)
+    );
+
+    // -------------------------------------------------------------------------
+    // Water meter
+    // -------------------------------------------------------------------------
+
+    g_waterAvailable =
+        g_waterCounter.begin(
+            Wire,
+            I2C_ADDR_PCF8574,
+            PCF8574_WATER_INPUT_BIT
+        );
+
+    Serial.printf(
+        "WATER : %s\n",
+        g_waterAvailable ? "OK" : "FAIL"
+    );
+
+    // -------------------------------------------------------------------------
+    // Environment sensors
+    // -------------------------------------------------------------------------
+
+    const bool envAvailable =
+        g_env.begin(Wire);
+
+    /*
+     * Perform an immediate real acquisition.
+     * Do not wait SENSOR_SAMPLE_PERIOD_MS after boot.
+     */
+    g_env.update();
+
+    const EnvData env =
+        g_env.getData();
+
+    Serial.printf(
+        "SHT   : %s\n",
+        env.sht30Present ? "OK" : "FAIL"
+    );
+
+    Serial.printf(
+        "MOIST : %s\n",
+        env.moisturePresent ? "OK" : "FAIL"
+    );
+
+    Serial.printf(
+        "ENV   : %s\n",
+        envAvailable ? "AVAILABLE" : "FAIL"
+    );
+
+#if ENABLE_GPS
+
+    g_gps.begin(
+        GpsSerial,
+        GPS_BAUDRATE,
+        PIN_GPS_RX,
+        PIN_GPS_TX
+    );
+
+    Serial.println("GPS   : INITIALIZED");
+
+#endif
+
+#if ENABLE_LORAWAN
+
+    /*
+     * LoRaWAN initialization will be restored here.
+     * For the current baseline ENABLE_LORAWAN == 0,
+     * therefore no radio initialization or transmission occurs.
+     */
+
+#endif
+
+    // Initial timestamps.
+    const uint32_t now = millis();
+
+    g_lastEnvSampleMs = now;
+    g_lastStatusMs = now;
+
+    Serial.println();
     Serial.println("System ready");
+    Serial.println("Type 'help' for commands.");
     Serial.println();
-    Serial.println();
+
+    /*
+     * First status immediately after startup.
+     */
+    printSnapshot(buildSnapshot());
 }
 
-void loop() {
+
+// -----------------------------------------------------------------------------
+// Main loop
+// -----------------------------------------------------------------------------
+
+void loop()
+{
     const uint32_t nowMs = millis();
 
-    handleLorawanSerial();
+    // Never block the main acquisition loop.
+    handleSerial();
 
 #if ENABLE_GPS
     g_gps.update();
 #endif
 
-    if (g_pcfPresent && (nowMs - g_lastWaterPollMs >= WATER_POLL_PERIOD_MS)) {
+    // -------------------------------------------------------------------------
+    // Water meter
+    // -------------------------------------------------------------------------
+
+    if (g_waterAvailable &&
+        (nowMs - g_lastWaterPollMs >= WATER_POLL_PERIOD_MS)) {
+
         g_lastWaterPollMs = nowMs;
         g_waterCounter.update(nowMs);
     }
 
+    // -------------------------------------------------------------------------
+    // Environment
+    // -------------------------------------------------------------------------
+
     if (nowMs - g_lastEnvSampleMs >= SENSOR_SAMPLE_PERIOD_MS) {
+
         g_lastEnvSampleMs = nowMs;
         g_env.update();
     }
 
-    if (MOISTURE_TEST_MODE) {
-        handleMoistureTestSerial();
+    // -------------------------------------------------------------------------
+    // Local status
+    // -------------------------------------------------------------------------
 
-        const EnvData env = g_env.getData();
+    if (nowMs - g_lastStatusMs >= STATUS_LOG_PERIOD_MS) {
 
-        if (!g_moisturePaused && env.moisturePresent) {
-            const uint16_t raw = env.moistureRaw;
+        g_lastStatusMs = nowMs;
 
-            g_moistureAccum += raw;
-            g_moistureSamples++;
+        const DeviceSnapshot snap =
+            buildSnapshot();
 
-            if (raw < g_moistureMin) {
-                g_moistureMin = raw;
-            }
-
-            if (raw > g_moistureMax) {
-                g_moistureMax = raw;
-            }
-        }
-
-        static constexpr uint32_t MOISTURE_CSV_PERIOD_MS = 1000U;
-        static constexpr uint16_t MOISTURE_MIN_SAMPLES_PER_ROW = 5U;
-
-        if (!g_moisturePaused &&
-            (nowMs - g_lastMoistureCsvMs >= MOISTURE_CSV_PERIOD_MS) &&
-            (g_moistureSamples >= MOISTURE_MIN_SAMPLES_PER_ROW)) {
-
-            g_lastMoistureCsvMs = nowMs;
-
-            const float avg = (float)g_moistureAccum / (float)g_moistureSamples;
-
-            Serial.print(nowMs);
-            Serial.print(",");
-            Serial.print(moisturePhaseToString(g_moisturePhase));
-            Serial.print(",");
-            Serial.print(env.moistureRaw);
-            Serial.print(",");
-            Serial.print(avg, 2);
-            Serial.print(",");
-            Serial.print(g_moistureMin);
-            Serial.print(",");
-            Serial.print(g_moistureMax);
-            Serial.print(",");
-            Serial.println(g_moistureSamples);
-
-            resetMoistureWindow();
-        }
-
-        return;
-    }
-
-    if (nowMs - g_lastLogMs >= STATUS_LOG_PERIOD_MS) {
-        g_lastLogMs = nowMs;
-        DeviceSnapshot snap = buildSnapshot();
         printSnapshot(snap);
-
-        std::vector<uint8_t> payload = PayloadBuilder::buildBinary(snap);
-        //Serial.print("Payload HEX: ");
-        //Serial.println(PayloadBuilder::toHex(payload));
     }
 
-    if (!ZENNER_TEST_MODE &&
-        !MOISTURE_TEST_MODE &&
-        (nowMs - g_lastTxMs >= g_lwCfg.uplinkPeriodMs)) {
+#if ENABLE_LORAWAN
 
-        g_lastTxMs = nowMs;
+    /*
+     * LoRaWAN periodic transmission will live here.
+     *
+     * Disabled completely in the current baseline.
+     */
 
-        DeviceSnapshot snap = buildSnapshot();
-        std::vector<uint8_t> payload = PayloadBuilder::buildBinary(snap);
-
-        Serial.print("[LORAWAN] real payload HEX: ");
-        Serial.println(PayloadBuilder::toHex(payload));
-
-        if (g_lwCfg.txEnable) {
-
-            bool txOk = g_lora.sendUplink(
-                payload.data(),
-                payload.size(),
-                g_lwCfg.uplinkFPort,
-                g_lwCfg.uplinkConfirmed
-            );
-
-            Serial.printf(
-                "LoRaWAN uplink: %s | bytes=%u | err=%d\n",
-                txOk ? "OK" : "FAIL",
-                (unsigned)payload.size(),
-                g_lora.getLastError()
-            );
-
-        } else {
-
-            Serial.printf(
-                "[LORAWAN] TX DISABLED | bytes=%u\n",
-                (unsigned)payload.size()
-            );
-        }
-    }
-}
-
-static void printLorawanHelp() {
-    Serial.println("LoRaWAN provisioning commands:");
-    Serial.println("  lw show");
-    Serial.println("  lw save");
-    Serial.println("  lw reset");
-    Serial.println("  lw reboot");
-    Serial.println("  lw set joineui <16hex>");
-    Serial.println("  lw set deveui <16hex>");
-    Serial.println("  lw set appkey <32hex>");
-    Serial.println("  lw set region EU868");
-    Serial.println("  lw set period <ms>");
-    Serial.println("  lw set fport <1..223>");
-    Serial.println("  lw set confirmed <0|1>");
-    Serial.println("  lw set tx <0|1>");
-}
-
-static bool parseOnOff(const String& s, bool& value) {
-    if (s == "1") { value = true; return true; }
-    if (s == "0") { value = false; return true; }
-    return false;
-}
-
-static void handleLorawanSerial() {
-    if (!Serial.available()) {
-        return;
-    }
-
-    String line = Serial.readStringUntil('\n');
-    line.trim();
-    if (line.length() == 0) {
-        return;
-    }
-
-    if (line == "i2c scan") {
-        scanI2CBus();
-        return;
-    }
-
-    if (line == "lw help") {
-        printLorawanHelp();
-        return;
-    }
-
-    if (line == "lw show") {
-        LorawanProvisioningStore::print(g_lwCfg, Serial);
-        return;
-    }
-
-    if (line == "lw save") {
-        bool ok = LorawanProvisioningStore::save(g_lwCfg);
-        Serial.println(ok ? "lw save OK" : "lw save FAIL");
-        return;
-    }
-
-    if (line == "lw reset") {
-        g_lwCfg = LorawanProvisioningStore::makeFactoryDefault();
-        bool ok = LorawanProvisioningStore::save(g_lwCfg);
-        Serial.println(ok ? "lw reset OK" : "lw reset FAIL");
-        return;
-    }
-
-    if (line == "lw reboot") {
-        Serial.println("rebooting...");
-        delay(200);
-        ESP.restart();
-        return;
-    }
-
-    if (!line.startsWith("lw set ")) {
-        return;
-    }
-
-    String rest = line.substring(7);
-    int sp = rest.indexOf(' ');
-    if (sp < 0) {
-        Serial.println("lw set FAIL");
-        return;
-    }
-
-    String key = rest.substring(0, sp);
-    String val = rest.substring(sp + 1);
-    key.trim();
-    val.trim();
-
-    if (key == "joineui") {
-        if (LorawanProvisioningStore::parseHex(val, g_lwCfg.joinEui, 8)) Serial.println("OK");
-        else Serial.println("FAIL");
-        return;
-    }
-
-    if (key == "deveui") {
-        if (LorawanProvisioningStore::parseHex(val, g_lwCfg.devEui, 8)) Serial.println("OK");
-        else Serial.println("FAIL");
-        return;
-    }
-
-    if (key == "appkey") {
-        if (LorawanProvisioningStore::parseHex(val, g_lwCfg.appKey, 16)) Serial.println("OK");
-        else Serial.println("FAIL");
-        return;
-    }
-
-    if (key == "region") {
-        if (val == "EU868") {
-            g_lwCfg.region = LorawanRegion::EU868;
-            Serial.println("OK");
-        } else {
-            Serial.println("FAIL");
-        }
-        return;
-    }
-
-    if (key == "period") {
-        uint32_t p = (uint32_t)val.toInt();
-        if (p >= 10000UL) {
-            g_lwCfg.uplinkPeriodMs = p;
-            Serial.println("OK");
-        } else {
-            Serial.println("FAIL");
-        }
-        return;
-    }
-
-    if (key == "fport") {
-        int p = val.toInt();
-        if (p >= 1 && p <= 223) {
-            g_lwCfg.uplinkFPort = (uint8_t)p;
-            Serial.println("OK");
-        } else {
-            Serial.println("FAIL");
-        }
-        return;
-    }
-
-    if (key == "confirmed") {
-        bool v = false;
-        if (parseOnOff(val, v)) {
-            g_lwCfg.uplinkConfirmed = v;
-            Serial.println("OK");
-        } else {
-            Serial.println("FAIL");
-        }
-        return;
-    }
-
-    if (key == "tx") {
-        bool v = false;
-        if (parseOnOff(val, v)) {
-            g_lwCfg.txEnable = v;
-            Serial.println("OK");
-        } else {
-            Serial.println("FAIL");
-        }
-        return;
-    }
-
-    Serial.println("unknown lw key");
+#endif
 }
