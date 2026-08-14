@@ -17,13 +17,14 @@ enum class MoistureState : uint8_t {
 
 struct EnvData {
     bool sht30Present = false;
+
     float temperatureC = NAN;
     float humidityRH = NAN;
 
     bool moisturePresent = false;
-    uint16_t moistureRaw = 0;
+    uint16_t moistureRaw = 0xFFFF;
 
-    uint8_t moisturePct = 0xFF;              // 0..100, 0xFF = invalid/not available
+    uint8_t moisturePct = 0xFF;
     MoistureState moistureState = MoistureState::INVALID;
 };
 
