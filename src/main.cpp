@@ -7,654 +7,1629 @@
 #include "pulse_counter.h"
 #include "env_service.h"
 #include "payload_builder.h"
+
+#if ENABLE_LORAWAN
 #include "lora_service.h"
 #include "lorawan_config.h"
 #include "lorawan_provisioning.h"
-
-static LorawanProvisioning g_lwCfg;
+#endif
 
 #if ENABLE_GPS
 #include "gps_service.h"
+#endif
+
+
+// -----------------------------------------------------------------------------
+// Services
+// -----------------------------------------------------------------------------
+
+static PulseCounterPcf8574 g_waterCounter;
+static EnvService g_env;
+
+#if ENABLE_LORAWAN
+static LoraService g_lora;
+static LorawanProvisioning g_lwCfg;
+static bool g_lwLoadedFromNvs = false;
+#endif
+
+#if ENABLE_GPS
 static HardwareSerial GpsSerial(1);
 static GpsService g_gps;
 #endif
 
-static PulseCounterPcf8574 g_waterCounter;
-static EnvService g_env;
-static LoraService g_lora;
 
-static bool g_pcfPresent = false;
+// -----------------------------------------------------------------------------
+// Runtime state
+// -----------------------------------------------------------------------------
+
+static bool g_waterInterfaceAvailable = false;
+
 static uint32_t g_lastWaterPollMs = 0;
 static uint32_t g_lastEnvSampleMs = 0;
+static uint32_t g_lastStatusMs = 0;
+
+#if ENABLE_LORAWAN
 static uint32_t g_lastTxMs = 0;
-static uint32_t g_lastLogMs = 0;
+#endif
 
-// Modalità test
-static constexpr bool ZENNER_TEST_MODE = false;
-static constexpr bool MOISTURE_TEST_MODE = false;
-
-// Stato storico per log ZENNER
 static uint32_t g_lastLoggedPulseCount = 0;
 static float g_lastLoggedLiters = 0.0f;
 
-// -----------------------------
-// Moisture test mode
-// -----------------------------
-enum class MoisturePhase : uint8_t {
-    AIR = 0,
-    DRY = 1,
-    WET = 2,
-    WATER = 3
-};
 
-static MoisturePhase g_moisturePhase = MoisturePhase::AIR;
-static bool g_moisturePaused = false;
+// -----------------------------------------------------------------------------
+// Utility
+// -----------------------------------------------------------------------------
 
-// Finestra statistica per log CSV
-static uint32_t g_moistureAccum = 0;
-static uint16_t g_moistureSamples = 0;
-static uint16_t g_moistureMin = 0xFFFF;
-static uint16_t g_moistureMax = 0;
-static uint32_t g_lastMoistureCsvMs = 0;
+static const char* moistureStateToString(MoistureState state)
+{
+    switch (state) {
 
-static const char* moisturePhaseToString(MoisturePhase phase) {
-    switch (phase) {
-        case MoisturePhase::AIR:   return "AIR";
-        case MoisturePhase::DRY:   return "DRY";
-        case MoisturePhase::WET:   return "WET";
-        case MoisturePhase::WATER: return "WATER";
-        default:                   return "UNKNOWN";
+        case MoistureState::DRY:
+            return "DRY";
+
+        case MoistureState::MOIST:
+            return "MOIST";
+
+        case MoistureState::WET:
+            return "WET";
+
+        case MoistureState::INVALID:
+        default:
+            return "INVALID";
     }
 }
 
-static void resetMoistureWindow() {
-    g_moistureAccum = 0;
-    g_moistureSamples = 0;
-    g_moistureMin = 0xFFFF;
-    g_moistureMax = 0;
-}
 
-static void setMoisturePhase(MoisturePhase phase) {
-    g_moisturePhase = phase;
-    resetMoistureWindow();
+static bool parseUnsignedInteger(
+    const String& text,
+    uint32_t& value
+)
+{
+    if (text.isEmpty()) {
+        return false;
+    }
 
-    Serial.print("# PHASE=");
-    Serial.println(moisturePhaseToString(g_moisturePhase));
-}
+    uint64_t result = 0;
 
-static void printMoistureTestHelp() {
-    Serial.println("# Moisture test commands:");
-    Serial.println("#   a -> phase AIR");
-    Serial.println("#   d -> phase DRY");
-    Serial.println("#   w -> phase WET");
-    Serial.println("#   x -> phase WATER");
-    Serial.println("#   p -> pause logging");
-    Serial.println("#   s -> resume logging");
-    Serial.println("#   r -> reset current averaging window");
-    Serial.println("#   h -> help");
-    Serial.println("# CSV columns:");
-    Serial.println("# ts_ms,phase,raw,avg,min,max,samples");
-}
+    for (size_t i = 0; i < text.length(); ++i) {
 
-static void handleMoistureTestSerial() {
-    while (Serial.available() > 0) {
-        const char c = (char)Serial.read();
+        const char c = text[i];
 
-        if (c == '\n' || c == '\r') {
-            continue;
+        if (c < '0' || c > '9') {
+            return false;
         }
 
-        switch (c) {
-            case 'a':
-            case 'A':
-                setMoisturePhase(MoisturePhase::AIR);
-                break;
+        result =
+            result * 10ULL +
+            static_cast<uint64_t>(c - '0');
 
-            case 'd':
-            case 'D':
-                setMoisturePhase(MoisturePhase::DRY);
-                break;
-
-            case 'w':
-            case 'W':
-                setMoisturePhase(MoisturePhase::WET);
-                break;
-
-            case 'x':
-            case 'X':
-                setMoisturePhase(MoisturePhase::WATER);
-                break;
-
-            case 'p':
-            case 'P':
-                g_moisturePaused = true;
-                Serial.println("# PAUSED");
-                break;
-
-            case 's':
-            case 'S':
-                g_moisturePaused = false;
-                resetMoistureWindow();
-                Serial.println("# RESUMED");
-                break;
-
-            case 'r':
-            case 'R':
-                resetMoistureWindow();
-                Serial.println("# WINDOW RESET");
-                break;
-
-            case 'h':
-            case 'H':
-            case '?':
-                printMoistureTestHelp();
-                break;
-
-            default:
-                Serial.print("# UNKNOWN CMD=");
-                Serial.println(c);
-                break;
+        if (result > 0xFFFFFFFFULL) {
+            return false;
         }
     }
+
+    value = static_cast<uint32_t>(result);
+
+    return true;
 }
 
-static void scanI2CBus() {
+
+// -----------------------------------------------------------------------------
+// I2C diagnostics
+// -----------------------------------------------------------------------------
+
+static void scanI2CBus()
+{
     Serial.println();
     Serial.println("I2C scan start");
 
-    for (uint8_t addr = 1; addr < 127; addr++) {
+    uint8_t count = 0;
+
+    for (uint8_t addr = 1; addr < 127; ++addr) {
+
         Wire.beginTransmission(addr);
-        uint8_t err = Wire.endTransmission(true);
+
+        const uint8_t err =
+            Wire.endTransmission(true);
 
         if (err == 0) {
-            Serial.print(" - found device at 0x");
-            if (addr < 16) Serial.print('0');
+
+            Serial.print("Found device at 0x");
+
+            if (addr < 0x10) {
+                Serial.print('0');
+            }
+
             Serial.println(addr, HEX);
-        } else if (err == 4) {
-            Serial.print(" - unknown error at 0x");
-            if (addr < 16) Serial.print('0');
-            Serial.println(addr, HEX);
+
+            ++count;
         }
     }
+
+    Serial.printf(
+        "Total devices: %u\n",
+        count
+    );
 
     Serial.println("I2C scan end");
     Serial.println();
 }
 
-static BatteryData readBatteryData() {
-    BatteryData data;
+
+// -----------------------------------------------------------------------------
+// Battery
+// -----------------------------------------------------------------------------
+
+static BatteryData readBatteryData()
+{
+    BatteryData data{};
+
+    /*
+     * ANDROMEDA:
+     *
+     * VBAT
+     *  |
+     * 10k
+     *  |
+     *  +---- V_CHECK ---- GPIO35
+     *  |
+     * 10k
+     *  |
+     * GND
+     *
+     * Therefore:
+     *
+     * V_CHECK = VBAT / 2
+     */
+
+    static constexpr uint8_t NUM_SAMPLES = 16;
+
+    uint32_t adcRawSum = 0;
+    uint32_t adcMvSum = 0;
+
+    for (uint8_t i = 0; i < NUM_SAMPLES; ++i) {
+
+        adcRawSum += analogRead(
+            PIN_BATTERY_ADC
+        );
+
+        adcMvSum += analogReadMilliVolts(
+            PIN_BATTERY_ADC
+        );
+
+        delay(2);
+    }
+
+    const uint32_t adcRaw =
+        adcRawSum / NUM_SAMPLES;
+
+    const uint32_t vCheckMv =
+        adcMvSum / NUM_SAMPLES;
+
+    const uint32_t batteryMv =
+        static_cast<uint32_t>(
+            static_cast<float>(vCheckMv) *
+            BATTERY_DIVIDER_RATIO
+        );
+
+    /*
+     * Plausibility check.
+     *
+     * Reject obviously invalid/open measurements.
+     */
+    if (batteryMv < 2500UL ||
+        batteryMv > 4500UL) {
+
+        data.valid = false;
+        data.millivolts = 0;
+        data.low = false;
+        data.critical = false;
+        data.solarPresent = false;
+        data.charging = false;
+
+        Serial.printf(
+            "BATT ADC raw=%lu vcheck=%lu mV vbat=%lu mV INVALID\n",
+            static_cast<unsigned long>(adcRaw),
+            static_cast<unsigned long>(vCheckMv),
+            static_cast<unsigned long>(batteryMv)
+        );
+
+        return data;
+    }
 
     data.valid = true;
 
-    // DEMO POWER TELEMETRY
-    data.solarPresent = true;
-    data.charging = true;
+    data.millivolts =
+        static_cast<uint16_t>(
+            batteryMv
+        );
 
-    // valore dimostrativo realistico
-    data.millivolts = 3890;
+    data.low =
+        batteryMv <
+        BATTERY_LOW_MV;
 
-    data.low = (data.millivolts <= BATTERY_LOW_MV);
-    data.critical = (data.millivolts <= BATTERY_CRITICAL_MV);
+    data.critical =
+        batteryMv <
+        BATTERY_CRITICAL_MV;
+
+    /*
+     * Not observable with current ANDROMEDA hardware.
+     */
+    data.solarPresent = false;
+    data.charging = false;
+
+    Serial.printf(
+        "BATT ADC raw=%lu vcheck=%lu mV vbat=%lu mV\n",
+        static_cast<unsigned long>(adcRaw),
+        static_cast<unsigned long>(vCheckMv),
+        static_cast<unsigned long>(batteryMv)
+    );
 
     return data;
 }
 
-static DeviceSnapshot buildSnapshot() {
+
+// -----------------------------------------------------------------------------
+// Snapshot
+// -----------------------------------------------------------------------------
+
+static DeviceSnapshot buildSnapshot()
+{
     DeviceSnapshot snap;
 
     snap.uptimeMs = millis();
 
-    snap.water = g_waterCounter.getData();
-    snap.env   = g_env.getData();
+    snap.water =
+        g_waterCounter.getData();
+
+    snap.env =
+        g_env.getData();
 
 #if ENABLE_GPS
-    snap.gps = g_gps.getData();
+
+    snap.gps =
+        g_gps.getData();
+
 #else
-    snap.gps = GpsData{};
+
+    snap.gps =
+        GpsData{};
+
 #endif
 
-    snap.battery = readBatteryData();
+    snap.battery =
+        readBatteryData();
 
     return snap;
 }
 
-static const char* moistureStateToString(MoistureState state) {
-    switch (state) {
-        case MoistureState::DRY:     return "DRY";
-        case MoistureState::MOIST:   return "MOIST";
-        case MoistureState::WET:     return "WET";
-        case MoistureState::INVALID: return "INVALID";
-        default:                     return "UNKNOWN";
+
+// -----------------------------------------------------------------------------
+// LoRaWAN helpers
+// -----------------------------------------------------------------------------
+
+#if ENABLE_LORAWAN
+
+static const char* loraStatusToString(int status)
+{
+    switch (status) {
+
+        case RADIOLIB_ERR_NONE:
+            return "OK";
+
+        case RADIOLIB_LORAWAN_NEW_SESSION:
+            return "NEW_SESSION";
+
+        case RADIOLIB_LORAWAN_SESSION_RESTORED:
+            return "SESSION_RESTORED";
+
+        /*
+         * RadioLib: no Join Accept was received.
+         * Kept numeric here to avoid depending on the exact
+         * symbolic-name availability of the installed RadioLib release.
+         */
+        case -1116:
+            return "NO_JOIN_ACCEPT";
+
+        default:
+            return "ERROR";
     }
 }
 
-static void printSnapshot(const DeviceSnapshot& s) {
-    Serial.println("===== ANDROMEDA STATUS =====");
 
-    Serial.println("Uptime: " + String(s.uptimeMs) + " ms");
+static void printLoraStatus()
+{
+    const int status =
+        g_lora.getLastError();
 
+    Serial.println();
     Serial.println(
-        "WATER  pulses=" + String(s.water.pulseCount) +
-        " liters=" + String(s.water.liters, 3) +
-        " line=" + String(s.water.lineState ? "HIGH" : "LOW") +
-        " lastPulseMs=" + String(s.water.lastPulseMs)
-    );
-
-    const uint32_t pulseDelta = s.water.pulseCount - g_lastLoggedPulseCount;
-    const float literDelta = s.water.liters - g_lastLoggedLiters;
-
-    Serial.println(
-        "WATERD pulses=" + String(pulseDelta) +
-        " liters=" + String(literDelta, 3)
+        "===== LORAWAN STATUS ====="
     );
 
     Serial.println(
-        "SHT30  present=" + String(s.env.sht30Present ? "YES" : "NO") +
-        " temp=" + String(s.env.temperatureC, 2) +
-        " C hum=" + String(s.env.humidityRH, 2) + " %RH"
+        "Compiled        : YES"
+    );
+
+    Serial.printf(
+        "Radio ready     : %s\n",
+        g_lora.isReady()
+            ? "YES"
+            : "NO"
+    );
+
+    Serial.printf(
+        "Joined          : %s\n",
+        g_lora.isJoined()
+            ? "YES"
+            : "NO"
+    );
+
+    Serial.printf(
+        "Last status     : %d (%s)\n",
+        status,
+        loraStatusToString(status)
+    );
+
+    Serial.printf(
+        "Provision source: %s\n",
+        g_lwLoadedFromNvs
+            ? "NVS"
+            : "FACTORY"
+    );
+
+    Serial.printf(
+        "Provision valid : %s\n",
+        g_lwCfg.valid
+            ? "YES"
+            : "NO"
+    );
+
+    Serial.printf(
+        "Provision ver.  : %lu\n",
+        static_cast<unsigned long>(
+            g_lwCfg.version
+        )
+    );
+
+    Serial.printf(
+        "Region          : %s\n",
+        g_lwCfg.region ==
+                LorawanRegion::EU868
+            ? "EU868"
+            : "UNKNOWN"
+    );
+
+    Serial.print(
+        "JoinEUI         : "
     );
 
     Serial.println(
-        "MOIST  present=" + String(s.env.moisturePresent ? "YES" : "NO") +
-        " raw=" + String(s.env.moistureRaw) +
-        " pct=" + String(s.env.moisturePct == 0xFF ? -1 : (int)s.env.moisturePct) +
-        " state=" + String(moistureStateToString(s.env.moistureState))
+        LorawanProvisioningStore::toHex(
+            g_lwCfg.joinEui,
+            sizeof(g_lwCfg.joinEui)
+        )
     );
 
-#if ENABLE_GPS
+    Serial.print(
+        "DevEUI          : "
+    );
+
     Serial.println(
-        "GPS    fix=" + String(s.gps.fix ? "YES" : "NO") +
-        " sats=" + String(s.gps.satellites) +
-        " lat=" + String(s.gps.latitude, 7) +
-        " lon=" + String(s.gps.longitude, 7) +
-        " alt=" + String(s.gps.altitudeMeters, 2) +
-        " hdop=" + String(s.gps.hdop, 2) +
-        " utc=" + String(s.gps.utc[0] ? s.gps.utc : "N/A") +
-        " age=" + String(s.gps.ageMs) + " ms"
+        LorawanProvisioningStore::toHex(
+            g_lwCfg.devEui,
+            sizeof(g_lwCfg.devEui)
+        )
     );
 
-    if (g_gps.getLastByteMs() == 0) {
-        Serial.println("GPSDBG rxBytes=" + String(g_gps.getRxBytes()) + " lastByteAgo=NEVER");
-    } else {
+    Serial.print(
+        "AppKey          : "
+    );
+
+    Serial.println(
+        LorawanProvisioningStore::toHex(
+            g_lwCfg.appKey,
+            sizeof(g_lwCfg.appKey)
+        )
+    );
+
+    Serial.printf(
+        "TX enabled      : %s\n",
+        g_lwCfg.txEnable
+            ? "YES"
+            : "NO"
+    );
+
+    Serial.printf(
+        "Uplink period   : %lu ms (%lu s)\n",
+        static_cast<unsigned long>(
+            g_lwCfg.uplinkPeriodMs
+        ),
+        static_cast<unsigned long>(
+            g_lwCfg.uplinkPeriodMs / 1000UL
+        )
+    );
+
+    Serial.printf(
+        "FPort           : %u\n",
+        static_cast<unsigned int>(
+            g_lwCfg.uplinkFPort
+        )
+    );
+
+    Serial.printf(
+        "Confirmed       : %s\n",
+        g_lwCfg.uplinkConfirmed
+            ? "YES"
+            : "NO"
+    );
+
+    Serial.println(
+        "=========================="
+    );
+
+    Serial.println();
+}
+
+
+static bool sendLoraUplink(
+    const DeviceSnapshot& snap,
+    const char* reason
+)
+{
+    if (!g_lora.isReady()) {
+
         Serial.println(
-            "GPSDBG rxBytes=" + String(g_gps.getRxBytes()) +
-            " lastByteAgo=" + String(millis() - g_gps.getLastByteMs()) + " ms"
+            "LoRaWAN send blocked: radio not ready"
+        );
+
+        return false;
+    }
+
+    if (!g_lora.isJoined()) {
+
+        Serial.println(
+            "LoRaWAN send blocked: device not joined"
+        );
+
+        return false;
+    }
+
+    const std::vector<uint8_t> payload =
+        PayloadBuilder::buildBinary(
+            snap
+        );
+
+    Serial.printf(
+        "[LORAWAN] %s payload=",
+        reason
+    );
+
+    Serial.println(
+        PayloadBuilder::toHex(payload)
+    );
+
+    const bool sent =
+        g_lora.sendUplink(
+            payload.data(),
+            payload.size(),
+            g_lwCfg.uplinkFPort,
+            g_lwCfg.uplinkConfirmed
+        );
+
+    const int status =
+        g_lora.getLastError();
+
+    Serial.printf(
+        "[LORAWAN] %s %s len=%u fport=%u status=%s (%d)\n",
+        reason,
+        sent ? "OK" : "FAIL",
+        static_cast<unsigned int>(
+            payload.size()
+        ),
+        static_cast<unsigned int>(
+            g_lwCfg.uplinkFPort
+        ),
+        loraStatusToString(status),
+        status
+    );
+
+    return sent;
+}
+
+#endif
+
+
+// -----------------------------------------------------------------------------
+// Status output
+// -----------------------------------------------------------------------------
+
+static void printSnapshot(
+    const DeviceSnapshot& s
+)
+{
+    Serial.println(
+        "===== ANDROMEDA STATUS ====="
+    );
+
+    Serial.printf(
+        "UPTIME %lu ms\n",
+        static_cast<unsigned long>(
+            s.uptimeMs
+        )
+    );
+
+    // -------------------------------------------------------------------------
+    // Water interface
+    // -------------------------------------------------------------------------
+
+    if (g_waterInterfaceAvailable) {
+
+        Serial.printf(
+            "WATER IF=OK pulses=%lu liters=%.3f line=%s lastPulseMs=%lu\n",
+            static_cast<unsigned long>(
+                s.water.pulseCount
+            ),
+            s.water.liters,
+            s.water.lineState
+                ? "HIGH"
+                : "LOW",
+            static_cast<unsigned long>(
+                s.water.lastPulseMs
+            )
+        );
+
+        const uint32_t pulseDelta =
+            s.water.pulseCount -
+            g_lastLoggedPulseCount;
+
+        const float literDelta =
+            s.water.liters -
+            g_lastLoggedLiters;
+
+        Serial.printf(
+            "WATERD pulses=%lu liters=%.3f\n",
+            static_cast<unsigned long>(
+                pulseDelta
+            ),
+            literDelta
+        );
+
+    } else {
+
+        Serial.println(
+            "WATER IF=FAIL"
         );
     }
+
+    // -------------------------------------------------------------------------
+    // Temperature / humidity
+    // -------------------------------------------------------------------------
+
+    if (!s.env.sht30Present) {
+
+        Serial.println(
+            "SHT    NOT PRESENT"
+        );
+
+    } else {
+
+        Serial.print(
+            "SHT    "
+        );
+
+        if (isnan(
+                s.env.temperatureC
+            )) {
+
+            Serial.print(
+                "temp=INVALID"
+            );
+
+        } else {
+
+            Serial.printf(
+                "temp=%.2f C",
+                s.env.temperatureC
+            );
+        }
+
+        Serial.print(" ");
+
+        if (isnan(
+                s.env.humidityRH
+            )) {
+
+            Serial.print(
+                "hum=INVALID"
+            );
+
+        } else {
+
+            Serial.printf(
+                "hum=%.2f %%RH",
+                s.env.humidityRH
+            );
+        }
+
+        Serial.println();
+    }
+
+    // -------------------------------------------------------------------------
+    // Soil moisture
+    // -------------------------------------------------------------------------
+
+    if (!s.env.moisturePresent ||
+        s.env.moistureRaw ==
+            0xFFFFU) {
+
+        Serial.println(
+            "MOIST  INVALID"
+        );
+
+    } else {
+
+        Serial.printf(
+            "MOIST  raw=%u pct=%d state=%s\n",
+            s.env.moistureRaw,
+            s.env.moisturePct ==
+                    0xFF
+                ? -1
+                : static_cast<int>(
+                    s.env.moisturePct
+                ),
+            moistureStateToString(
+                s.env.moistureState
+            )
+        );
+    }
+
+#if ENABLE_GPS
+
+    Serial.printf(
+        "GPS    fix=%s sats=%lu lat=%.7f lon=%.7f alt=%.2f hdop=%.2f\n",
+        s.gps.fix
+            ? "YES"
+            : "NO",
+        static_cast<unsigned long>(
+            s.gps.satellites
+        ),
+        s.gps.latitude,
+        s.gps.longitude,
+        s.gps.altitudeMeters,
+        s.gps.hdop
+    );
+
+#endif
+
+    // -------------------------------------------------------------------------
+    // Battery
+    // -------------------------------------------------------------------------
+
+    if (s.battery.valid) {
+
+        Serial.printf(
+            "BATT   mv=%u low=%s critical=%s solar=%s charging=%s\n",
+            s.battery.millivolts,
+            s.battery.low
+                ? "YES"
+                : "NO",
+            s.battery.critical
+                ? "YES"
+                : "NO",
+            s.battery.solarPresent
+                ? "YES"
+                : "NO",
+            s.battery.charging
+                ? "YES"
+                : "NO"
+        );
+
+    } else {
+
+        Serial.println(
+            "BATT   INVALID / NOT IMPLEMENTED"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Payload
+    // -------------------------------------------------------------------------
+
+    const std::vector<uint8_t> payload =
+        PayloadBuilder::buildBinary(
+            s
+        );
+
+    Serial.print(
+        "PAYLOAD v4 HEX="
+    );
+
+    Serial.println(
+        PayloadBuilder::toHex(
+            payload
+        )
+    );
+
+    // -------------------------------------------------------------------------
+    // LoRaWAN compact status
+    // -------------------------------------------------------------------------
+
+#if ENABLE_LORAWAN
+
+    const int status =
+        g_lora.getLastError();
+
+    Serial.printf(
+        "LORA   ready=%s joined=%s tx=%s period=%lus status=%s (%d)\n",
+        g_lora.isReady()
+            ? "YES"
+            : "NO",
+        g_lora.isJoined()
+            ? "YES"
+            : "NO",
+        g_lwCfg.txEnable
+            ? "YES"
+            : "NO",
+        static_cast<unsigned long>(
+            g_lwCfg.uplinkPeriodMs /
+            1000UL
+        ),
+        loraStatusToString(
+            status
+        ),
+        status
+    );
+
+#else
+
+    Serial.println(
+        "LORA   DISABLED"
+    );
+
 #endif
 
     Serial.println(
-        "BATT   valid=" + String(s.battery.valid ? "YES" : "NO") +
-        " mv=" + String(s.battery.millivolts) +
-        " low=" + String(s.battery.low ? "YES" : "NO") +
-        " critical=" + String(s.battery.critical ? "YES" : "NO") +
-        " solar=" + String(s.battery.solarPresent ? "YES" : "NO") +
-        " charging=" + String(s.battery.charging ? "YES" : "NO")
+        "============================"
     );
 
-    Serial.println("============================");
+    Serial.println();
 
-    g_lastLoggedPulseCount = s.water.pulseCount;
-    g_lastLoggedLiters = s.water.liters;
+    g_lastLoggedPulseCount =
+        s.water.pulseCount;
+
+    g_lastLoggedLiters =
+        s.water.liters;
 }
 
-static void printLorawanHelp();
-static void handleLorawanSerial();
-static bool parseOnOff(const String& s, bool& value);
 
-void setup() {
-    Serial.begin(115200);
-    delay(5000);
+// -----------------------------------------------------------------------------
+// Serial commands
+// -----------------------------------------------------------------------------
 
-    pinMode(PIN_BATTERY_ADC, INPUT);
-    analogReadResolution(12);
+static void printHelp()
+{
+    Serial.println();
+    Serial.println(
+        "ANDROMEDA commands:"
+    );
 
     Serial.println();
-    Serial.println("ANDROMEDA @ ZESPRI");
-    Serial.println("Booting...");
 
-    if (!LorawanProvisioningStore::load(g_lwCfg)) {
-        Serial.println("CFG  : DEFAULT");
-        g_lwCfg = LorawanProvisioningStore::makeFactoryDefault();
-        LorawanProvisioningStore::save(g_lwCfg);
-    } else {
-        Serial.println("CFG  : OK");
-    }
+    Serial.println(
+        "  status             Refresh sensors and show device status"
+    );
 
-    LorawanProvisioningStore::print(g_lwCfg, Serial);
-    printLorawanHelp();
+#if ENABLE_LORAWAN
 
+    Serial.println(
+        "  lora               Show complete LoRaWAN status"
+    );
 
-    if (ZENNER_TEST_MODE) {
-        Serial.println("MODE: ZENNER TEST");
-        Serial.println("Radio TX temporarily disabled");
-    }
+    Serial.println(
+        "  lora join          Join network if not already joined"
+    );
 
-    if (MOISTURE_TEST_MODE) {
-        Serial.println("MODE: MOISTURE TEST");
-        Serial.println("Normal telemetry and radio TX temporarily disabled");
-    }
+    Serial.println(
+        "  lora send          Send one telemetry uplink now"
+    );
 
-    Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-    Wire.setClock(100000);
-    Wire.setTimeOut(50);
+    Serial.println(
+        "  lora tx off        Disable periodic LoRaWAN uplinks"
+    );
 
-    g_pcfPresent = g_waterCounter.begin(Wire, I2C_ADDR_PCF8574, PCF8574_WATER_INPUT_BIT);
-    Serial.printf("WATER: %s\n", g_pcfPresent ? "OK" : "FAIL");
+    Serial.println(
+        "  lora tx on         Enable periodic LoRaWAN uplinks"
+    );
 
-    bool envOk = g_env.begin(Wire);
-    Serial.printf("ENV  : %s\n", envOk ? "OK" : "FAIL");
+    Serial.println(
+        "  lora period <sec>  Set periodic uplink interval"
+    );
 
-#if ENABLE_GPS
-    g_gps.begin(GpsSerial, GPS_BAUDRATE, PIN_GPS_RX, PIN_GPS_TX);
-    Serial.println("GPS UART initialized");
 #endif
 
-    if (!ZENNER_TEST_MODE && !MOISTURE_TEST_MODE) {
-        if (!g_lwCfg.txEnable) {
-            Serial.println("LORA : TX DISABLED");
-        } else {
-            bool loraOk = g_lora.begin(g_lwCfg);
+    Serial.println(
+        "  i2c scan           Scan the I2C bus"
+    );
 
-            if (!loraOk) {
-                Serial.printf("LORA : INIT FAIL (%d)\n", g_lora.getLastError());
-            } else {
-                bool joinOk = g_lora.join();
+    Serial.println(
+        "  reboot             Reboot the device"
+    );
 
-                if (joinOk) {
-                    Serial.println("LORA : OK");
-                } else {
-                    Serial.printf("LORA : JOIN FAIL (%d)\n", g_lora.getLastError());
-                }
-            }
-        }
-    }
+    Serial.println(
+        "  help               Show this help"
+    );
 
-    if (MOISTURE_TEST_MODE) {
-        printMoistureTestHelp();
-        Serial.println("# ts_ms,phase,raw,avg,min,max,samples");
-        setMoisturePhase(MoisturePhase::AIR);
-        g_moisturePaused = false;
-    }
-
-    Serial.println("System ready");
-    Serial.println();
     Serial.println();
 }
 
-void loop() {
-    const uint32_t nowMs = millis();
 
-    handleLorawanSerial();
+static void processCommand(
+    const String& command
+)
+{
+    // -------------------------------------------------------------------------
+    // General
+    // -------------------------------------------------------------------------
 
-#if ENABLE_GPS
-    g_gps.update();
-#endif
+    if (command == "i2c scan") {
 
-    if (g_pcfPresent && (nowMs - g_lastWaterPollMs >= WATER_POLL_PERIOD_MS)) {
-        g_lastWaterPollMs = nowMs;
-        g_waterCounter.update(nowMs);
-    }
-
-    if (nowMs - g_lastEnvSampleMs >= SENSOR_SAMPLE_PERIOD_MS) {
-        g_lastEnvSampleMs = nowMs;
-        g_env.update();
-    }
-
-    if (MOISTURE_TEST_MODE) {
-        handleMoistureTestSerial();
-
-        const EnvData env = g_env.getData();
-
-        if (!g_moisturePaused && env.moisturePresent) {
-            const uint16_t raw = env.moistureRaw;
-
-            g_moistureAccum += raw;
-            g_moistureSamples++;
-
-            if (raw < g_moistureMin) {
-                g_moistureMin = raw;
-            }
-
-            if (raw > g_moistureMax) {
-                g_moistureMax = raw;
-            }
-        }
-
-        static constexpr uint32_t MOISTURE_CSV_PERIOD_MS = 1000U;
-        static constexpr uint16_t MOISTURE_MIN_SAMPLES_PER_ROW = 5U;
-
-        if (!g_moisturePaused &&
-            (nowMs - g_lastMoistureCsvMs >= MOISTURE_CSV_PERIOD_MS) &&
-            (g_moistureSamples >= MOISTURE_MIN_SAMPLES_PER_ROW)) {
-
-            g_lastMoistureCsvMs = nowMs;
-
-            const float avg = (float)g_moistureAccum / (float)g_moistureSamples;
-
-            Serial.print(nowMs);
-            Serial.print(",");
-            Serial.print(moisturePhaseToString(g_moisturePhase));
-            Serial.print(",");
-            Serial.print(env.moistureRaw);
-            Serial.print(",");
-            Serial.print(avg, 2);
-            Serial.print(",");
-            Serial.print(g_moistureMin);
-            Serial.print(",");
-            Serial.print(g_moistureMax);
-            Serial.print(",");
-            Serial.println(g_moistureSamples);
-
-            resetMoistureWindow();
-        }
-
-        return;
-    }
-
-    if (nowMs - g_lastLogMs >= STATUS_LOG_PERIOD_MS) {
-        g_lastLogMs = nowMs;
-        DeviceSnapshot snap = buildSnapshot();
-        printSnapshot(snap);
-
-        std::vector<uint8_t> payload = PayloadBuilder::buildBinary(snap);
-        //Serial.print("Payload HEX: ");
-        //Serial.println(PayloadBuilder::toHex(payload));
-    }
-
-    if (!ZENNER_TEST_MODE &&
-        !MOISTURE_TEST_MODE &&
-        (nowMs - g_lastTxMs >= g_lwCfg.uplinkPeriodMs)) {
-
-        g_lastTxMs = nowMs;
-
-        DeviceSnapshot snap = buildSnapshot();
-        std::vector<uint8_t> payload = PayloadBuilder::buildBinary(snap);
-
-        Serial.print("[LORAWAN] real payload HEX: ");
-        Serial.println(PayloadBuilder::toHex(payload));
-
-        if (g_lwCfg.txEnable) {
-
-            bool txOk = g_lora.sendUplink(
-                payload.data(),
-                payload.size(),
-                g_lwCfg.uplinkFPort,
-                g_lwCfg.uplinkConfirmed
-            );
-
-            Serial.printf(
-                "LoRaWAN uplink: %s | bytes=%u | err=%d\n",
-                txOk ? "OK" : "FAIL",
-                (unsigned)payload.size(),
-                g_lora.getLastError()
-            );
-
-        } else {
-
-            Serial.printf(
-                "[LORAWAN] TX DISABLED | bytes=%u\n",
-                (unsigned)payload.size()
-            );
-        }
-    }
-}
-
-static void printLorawanHelp() {
-    Serial.println("LoRaWAN provisioning commands:");
-    Serial.println("  lw show");
-    Serial.println("  lw save");
-    Serial.println("  lw reset");
-    Serial.println("  lw reboot");
-    Serial.println("  lw set joineui <16hex>");
-    Serial.println("  lw set deveui <16hex>");
-    Serial.println("  lw set appkey <32hex>");
-    Serial.println("  lw set region EU868");
-    Serial.println("  lw set period <ms>");
-    Serial.println("  lw set fport <1..223>");
-    Serial.println("  lw set confirmed <0|1>");
-    Serial.println("  lw set tx <0|1>");
-}
-
-static bool parseOnOff(const String& s, bool& value) {
-    if (s == "1") { value = true; return true; }
-    if (s == "0") { value = false; return true; }
-    return false;
-}
-
-static void handleLorawanSerial() {
-    if (!Serial.available()) {
-        return;
-    }
-
-    String line = Serial.readStringUntil('\n');
-    line.trim();
-    if (line.length() == 0) {
-        return;
-    }
-
-    if (line == "i2c scan") {
         scanI2CBus();
         return;
     }
 
-    if (line == "lw help") {
-        printLorawanHelp();
+    if (command == "status") {
+
+        /*
+         * Force a fresh environmental sample so the
+         * interactive status command reflects the current
+         * sensor values rather than only the last periodic
+         * acquisition.
+         */
+        g_env.update();
+
+        g_lastEnvSampleMs =
+            millis();
+
+        printSnapshot(
+            buildSnapshot()
+        );
+
         return;
     }
 
-    if (line == "lw show") {
-        LorawanProvisioningStore::print(g_lwCfg, Serial);
+#if ENABLE_LORAWAN
+
+    // -------------------------------------------------------------------------
+    // LoRaWAN status
+    // -------------------------------------------------------------------------
+
+    if (command == "lora") {
+
+        printLoraStatus();
         return;
     }
 
-    if (line == "lw save") {
-        bool ok = LorawanProvisioningStore::save(g_lwCfg);
-        Serial.println(ok ? "lw save OK" : "lw save FAIL");
+    // -------------------------------------------------------------------------
+    // LoRaWAN manual join
+    // -------------------------------------------------------------------------
+
+    if (command == "lora join") {
+
+        if (!g_lora.isReady()) {
+
+            Serial.println(
+                "LoRaWAN join blocked: radio not ready"
+            );
+
+            return;
+        }
+
+        if (g_lora.isJoined()) {
+
+            Serial.println(
+                "LoRaWAN: already joined"
+            );
+
+            return;
+        }
+
+        Serial.println(
+            "LoRaWAN: joining..."
+        );
+
+        const bool joined =
+            g_lora.join();
+
+        const int status =
+            g_lora.getLastError();
+
+        Serial.printf(
+            "LoRaWAN join: %s status=%s (%d)\n",
+            joined
+                ? "OK"
+                : "FAIL",
+            loraStatusToString(
+                status
+            ),
+            status
+        );
+
         return;
     }
 
-    if (line == "lw reset") {
-        g_lwCfg = LorawanProvisioningStore::makeFactoryDefault();
-        bool ok = LorawanProvisioningStore::save(g_lwCfg);
-        Serial.println(ok ? "lw reset OK" : "lw reset FAIL");
+    // -------------------------------------------------------------------------
+    // LoRaWAN manual uplink
+    // -------------------------------------------------------------------------
+
+    if (command == "lora send") {
+
+        /*
+         * Acquire fresh environmental data before an
+         * explicitly requested uplink.
+         */
+        g_env.update();
+
+        g_lastEnvSampleMs =
+            millis();
+
+        sendLoraUplink(
+            buildSnapshot(),
+            "manual uplink"
+        );
+
         return;
     }
 
-    if (line == "lw reboot") {
-        Serial.println("rebooting...");
-        delay(200);
+    // -------------------------------------------------------------------------
+    // Periodic TX enable / disable
+    // -------------------------------------------------------------------------
+
+    if (command == "lora tx off") {
+
+        g_lwCfg.txEnable =
+            false;
+
+        const bool saved =
+            LorawanProvisioningStore::save(
+                g_lwCfg
+            );
+
+        Serial.printf(
+            "LoRaWAN periodic TX: OFF%s\n",
+            saved
+                ? " (saved to NVS)"
+                : " (NVS SAVE FAILED)"
+        );
+
+        if (saved) {
+            g_lwLoadedFromNvs = true;
+        }
+
+        return;
+    }
+
+
+    if (command == "lora tx on") {
+
+        g_lwCfg.txEnable =
+            true;
+
+        const bool saved =
+            LorawanProvisioningStore::save(
+                g_lwCfg
+            );
+
+        /*
+         * Start a complete new period from now.
+         */
+        g_lastTxMs =
+            millis();
+
+        Serial.printf(
+            "LoRaWAN periodic TX: ON%s\n",
+            saved
+                ? " (saved to NVS)"
+                : " (NVS SAVE FAILED)"
+        );
+
+        if (saved) {
+            g_lwLoadedFromNvs = true;
+        }
+
+        return;
+    }
+
+    // -------------------------------------------------------------------------
+    // Dynamic uplink period
+    // -------------------------------------------------------------------------
+
+    if (command.startsWith(
+            "lora period "
+        )) {
+
+        String valueText =
+            command.substring(
+                String(
+                    "lora period "
+                ).length()
+            );
+
+        valueText.trim();
+
+        uint32_t seconds = 0;
+
+        if (!parseUnsignedInteger(
+                valueText,
+                seconds
+            )) {
+
+            Serial.println(
+                "Invalid period."
+            );
+
+            Serial.println(
+                "Usage: lora period <seconds>"
+            );
+
+            return;
+        }
+
+        /*
+         * LorawanProvisioningStore::isSane()
+         * already rejects periods shorter than
+         * 10000 ms. Make the constraint explicit
+         * at the CLI as well.
+         */
+        if (seconds < 10UL) {
+
+            Serial.println(
+                "Invalid period: minimum is 10 seconds."
+            );
+
+            return;
+        }
+
+        /*
+         * One day is more than enough for this
+         * installation and protects against obvious
+         * accidental input.
+         */
+        if (seconds > 86400UL) {
+
+            Serial.println(
+                "Invalid period: maximum is 86400 seconds."
+            );
+
+            return;
+        }
+
+        const uint32_t oldPeriodMs =
+            g_lwCfg.uplinkPeriodMs;
+
+        g_lwCfg.uplinkPeriodMs =
+            seconds * 1000UL;
+
+        const bool saved =
+            LorawanProvisioningStore::save(
+                g_lwCfg
+            );
+
+        if (!saved) {
+
+            /*
+             * Restore the runtime value if NVS
+             * persistence failed.
+             */
+            g_lwCfg.uplinkPeriodMs =
+                oldPeriodMs;
+
+            Serial.println(
+                "LoRaWAN period update FAILED: NVS save failed."
+            );
+
+            return;
+        }
+
+        g_lwLoadedFromNvs =
+            true;
+
+        /*
+         * Start the new interval from the instant
+         * the configuration changes.
+         */
+        g_lastTxMs =
+            millis();
+
+        Serial.printf(
+            "LoRaWAN uplink period: %lu seconds (saved to NVS)\n",
+            static_cast<unsigned long>(
+                seconds
+            )
+        );
+
+        return;
+    }
+
+#endif
+
+    // -------------------------------------------------------------------------
+    // Reboot
+    // -------------------------------------------------------------------------
+
+    if (command == "reboot") {
+
+        Serial.println(
+            "Rebooting..."
+        );
+
+        delay(100);
+
         ESP.restart();
+
         return;
     }
 
-    if (!line.startsWith("lw set ")) {
+    // -------------------------------------------------------------------------
+    // Help
+    // -------------------------------------------------------------------------
+
+    if (command == "help") {
+
+        printHelp();
         return;
     }
 
-    String rest = line.substring(7);
-    int sp = rest.indexOf(' ');
-    if (sp < 0) {
-        Serial.println("lw set FAIL");
-        return;
-    }
+    Serial.println(
+        "Unknown command"
+    );
+}
 
-    String key = rest.substring(0, sp);
-    String val = rest.substring(sp + 1);
-    key.trim();
-    val.trim();
 
-    if (key == "joineui") {
-        if (LorawanProvisioningStore::parseHex(val, g_lwCfg.joinEui, 8)) Serial.println("OK");
-        else Serial.println("FAIL");
-        return;
-    }
+// -----------------------------------------------------------------------------
+// Non-blocking serial input
+// -----------------------------------------------------------------------------
 
-    if (key == "deveui") {
-        if (LorawanProvisioningStore::parseHex(val, g_lwCfg.devEui, 8)) Serial.println("OK");
-        else Serial.println("FAIL");
-        return;
-    }
+static void handleSerial()
+{
+    static String line;
 
-    if (key == "appkey") {
-        if (LorawanProvisioningStore::parseHex(val, g_lwCfg.appKey, 16)) Serial.println("OK");
-        else Serial.println("FAIL");
-        return;
-    }
+    while (Serial.available() > 0) {
 
-    if (key == "region") {
-        if (val == "EU868") {
-            g_lwCfg.region = LorawanRegion::EU868;
-            Serial.println("OK");
-        } else {
-            Serial.println("FAIL");
+        const char c =
+            static_cast<char>(
+                Serial.read()
+            );
+
+        if (c == '\r') {
+            continue;
         }
-        return;
-    }
 
-    if (key == "period") {
-        uint32_t p = (uint32_t)val.toInt();
-        if (p >= 10000UL) {
-            g_lwCfg.uplinkPeriodMs = p;
-            Serial.println("OK");
-        } else {
-            Serial.println("FAIL");
+        if (c == '\n') {
+
+            line.trim();
+
+            if (!line.isEmpty()) {
+
+                processCommand(
+                    line
+                );
+            }
+
+            line = "";
+
+            continue;
         }
-        return;
-    }
 
-    if (key == "fport") {
-        int p = val.toInt();
-        if (p >= 1 && p <= 223) {
-            g_lwCfg.uplinkFPort = (uint8_t)p;
-            Serial.println("OK");
-        } else {
-            Serial.println("FAIL");
+        /*
+         * Bound command length so malformed serial
+         * input cannot grow String indefinitely.
+         */
+        if (line.length() < 80) {
+
+            line += c;
         }
-        return;
+    }
+}
+
+
+// -----------------------------------------------------------------------------
+// Setup
+// -----------------------------------------------------------------------------
+
+void setup()
+{
+    analogReadResolution(12);
+
+    analogSetPinAttenuation(
+        PIN_BATTERY_ADC,
+        ADC_11db
+    );
+
+    Serial.begin(115200);
+
+    /*
+     * Short startup delay only.
+     *
+     * During development:
+     *   1. open the serial monitor;
+     *   2. press RESET / EN;
+     *
+     * No long boot delay is required.
+     */
+    delay(1500);
+
+    Serial.println();
+
+    Serial.println(
+        "ANDROMEDA @ ZESPRI"
+    );
+
+    Serial.println(
+        "Booting..."
+    );
+
+#if ENABLE_LORAWAN
+
+    Serial.println(
+        "BUILD : LORAWAN ENABLED"
+    );
+
+#else
+
+    Serial.println(
+        "BUILD : LOCAL TELEMETRY ONLY"
+    );
+
+#endif
+
+    // -------------------------------------------------------------------------
+    // I2C
+    // -------------------------------------------------------------------------
+
+    pinMode(
+        PIN_I2C_SDA,
+        INPUT_PULLUP
+    );
+
+    pinMode(
+        PIN_I2C_SCL,
+        INPUT_PULLUP
+    );
+
+    Serial.printf(
+        "I2C lines before init: SDA=%d SCL=%d\n",
+        digitalRead(
+            PIN_I2C_SDA
+        ),
+        digitalRead(
+            PIN_I2C_SCL
+        )
+    );
+
+    Wire.begin(
+        PIN_I2C_SDA,
+        PIN_I2C_SCL
+    );
+
+    Wire.setClock(
+        I2C_FREQUENCY_HZ
+    );
+
+    Wire.setTimeOut(
+        I2C_TIMEOUT_MS
+    );
+
+    Serial.printf(
+        "I2C lines after init : SDA=%d SCL=%d\n",
+        digitalRead(
+            PIN_I2C_SDA
+        ),
+        digitalRead(
+            PIN_I2C_SCL
+        )
+    );
+
+    // -------------------------------------------------------------------------
+    // Water meter interface
+    // -------------------------------------------------------------------------
+
+    g_waterInterfaceAvailable =
+        g_waterCounter.begin(
+            Wire,
+            I2C_ADDR_PCF8574,
+            PCF8574_WATER_INPUT_BIT
+        );
+
+    Serial.printf(
+        "WATER IF : %s\n",
+        g_waterInterfaceAvailable
+            ? "OK"
+            : "FAIL"
+    );
+
+    // -------------------------------------------------------------------------
+    // Environment sensors
+    // -------------------------------------------------------------------------
+
+    const bool envAvailable =
+        g_env.begin(
+            Wire
+        );
+
+    /*
+     * Immediate first acquisition.
+     */
+    g_env.update();
+
+    const EnvData env =
+        g_env.getData();
+
+    Serial.printf(
+        "SHT   : %s\n",
+        env.sht30Present
+            ? "OK"
+            : "FAIL"
+    );
+
+    Serial.printf(
+        "MOIST : %s\n",
+        env.moisturePresent
+            ? "OK"
+            : "FAIL"
+    );
+
+    Serial.printf(
+        "ENV   : %s\n",
+        envAvailable
+            ? "AVAILABLE"
+            : "FAIL"
+    );
+
+    // -------------------------------------------------------------------------
+    // GPS
+    // -------------------------------------------------------------------------
+
+#if ENABLE_GPS
+
+    g_gps.begin(
+        GpsSerial,
+        GPS_BAUDRATE,
+        PIN_GPS_RX,
+        PIN_GPS_TX
+    );
+
+    Serial.println(
+        "GPS   : INITIALIZED"
+    );
+
+#endif
+
+    // -------------------------------------------------------------------------
+    // LoRaWAN
+    // -------------------------------------------------------------------------
+
+#if ENABLE_LORAWAN
+
+    Serial.println();
+
+    Serial.println(
+        "Initializing LoRaWAN..."
+    );
+
+    /*
+     * Runtime provisioning stored in NVS has
+     * precedence over factory defaults.
+     */
+    g_lwLoadedFromNvs =
+        LorawanProvisioningStore::load(
+            g_lwCfg
+        );
+
+    if (g_lwLoadedFromNvs) {
+
+        Serial.println(
+            "[LORAWAN] Provisioning loaded from NVS"
+        );
+
+    } else {
+
+        Serial.println(
+            "[LORAWAN] No valid NVS provisioning; using factory defaults"
+        );
+
+        g_lwCfg =
+            LorawanProvisioningStore::
+                makeFactoryDefault();
     }
 
-    if (key == "confirmed") {
-        bool v = false;
-        if (parseOnOff(val, v)) {
-            g_lwCfg.uplinkConfirmed = v;
-            Serial.println("OK");
-        } else {
-            Serial.println("FAIL");
-        }
-        return;
+    /*
+     * Explicit provisioning dump during development.
+     *
+     * NOTE:
+     * this includes AppKey by design for the current
+     * laboratory/debug phase.
+     */
+    LorawanProvisioningStore::print(
+        g_lwCfg,
+        Serial
+    );
+
+    const bool loraReady =
+        g_lora.begin(
+            g_lwCfg
+        );
+
+    Serial.printf(
+        "LORA RADIO : %s\n",
+        loraReady
+            ? "OK"
+            : "FAIL"
+    );
+
+    if (loraReady) {
+
+        Serial.println(
+            "[LORAWAN] Joining or restoring session..."
+        );
+
+        const bool joined =
+            g_lora.join();
+
+        const int status =
+            g_lora.getLastError();
+
+        Serial.printf(
+            "LORA JOIN  : %s status=%s (%d)\n",
+            joined
+                ? "OK"
+                : "FAIL",
+            loraStatusToString(
+                status
+            ),
+            status
+        );
     }
 
-    if (key == "tx") {
-        bool v = false;
-        if (parseOnOff(val, v)) {
-            g_lwCfg.txEnable = v;
-            Serial.println("OK");
-        } else {
-            Serial.println("FAIL");
-        }
-        return;
+#endif
+
+    // -------------------------------------------------------------------------
+    // Initial timestamps
+    // -------------------------------------------------------------------------
+
+    const uint32_t now =
+        millis();
+
+    g_lastWaterPollMs =
+        now;
+
+    g_lastEnvSampleMs =
+        now;
+
+    g_lastStatusMs =
+        now;
+
+#if ENABLE_LORAWAN
+
+    g_lastTxMs =
+        now;
+
+#endif
+
+    // -------------------------------------------------------------------------
+    // Ready
+    // -------------------------------------------------------------------------
+
+    Serial.println();
+
+    Serial.println(
+        "System ready"
+    );
+
+    Serial.println(
+        "Type 'help' for commands."
+    );
+
+    Serial.println();
+
+    printSnapshot(
+        buildSnapshot()
+    );
+}
+
+
+// -----------------------------------------------------------------------------
+// Main loop
+// -----------------------------------------------------------------------------
+
+void loop()
+{
+    const uint32_t nowMs =
+        millis();
+
+    // -------------------------------------------------------------------------
+    // Serial console
+    // -------------------------------------------------------------------------
+
+    handleSerial();
+
+    // -------------------------------------------------------------------------
+    // GPS
+    // -------------------------------------------------------------------------
+
+#if ENABLE_GPS
+
+    g_gps.update();
+
+#endif
+
+    // -------------------------------------------------------------------------
+    // Water meter
+    // -------------------------------------------------------------------------
+
+    if (g_waterInterfaceAvailable &&
+        (nowMs -
+             g_lastWaterPollMs >=
+         WATER_POLL_PERIOD_MS)) {
+
+        g_lastWaterPollMs =
+            nowMs;
+
+        g_waterCounter.update(
+            nowMs
+        );
     }
 
-    Serial.println("unknown lw key");
+    // -------------------------------------------------------------------------
+    // Environment
+    // -------------------------------------------------------------------------
+
+    if (nowMs -
+            g_lastEnvSampleMs >=
+        SENSOR_SAMPLE_PERIOD_MS) {
+
+        g_lastEnvSampleMs =
+            nowMs;
+
+        g_env.update();
+    }
+
+    // -------------------------------------------------------------------------
+    // Periodic local status
+    // -------------------------------------------------------------------------
+
+    if (nowMs -
+            g_lastStatusMs >=
+        STATUS_LOG_PERIOD_MS) {
+
+        g_lastStatusMs =
+            nowMs;
+
+        printSnapshot(
+            buildSnapshot()
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Periodic LoRaWAN uplink
+    // -------------------------------------------------------------------------
+
+#if ENABLE_LORAWAN
+
+    if (g_lwCfg.txEnable &&
+        g_lora.isJoined() &&
+        (nowMs -
+             g_lastTxMs >=
+         g_lwCfg.uplinkPeriodMs)) {
+
+        g_lastTxMs =
+            nowMs;
+
+        sendLoraUplink(
+            buildSnapshot(),
+            "periodic uplink"
+        );
+    }
+
+#endif
 }

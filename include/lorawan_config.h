@@ -19,7 +19,7 @@ static const uint8_t LORAWAN_APP_KEY[16] = {
 };
 
 // Primo test: LoRaWAN 1.0.x / Class A / uplink prudente
-static constexpr uint32_t LORAWAN_UPLINK_PERIOD_MS = 300000UL; // 5 minuti
+static constexpr uint32_t LORAWAN_UPLINK_PERIOD_MS = 3600000UL; // 1 ora
 static constexpr uint8_t  LORAWAN_UPLINK_FPORT = 1;
 static constexpr bool     LORAWAN_UPLINK_CONFIRMED = false;
 
