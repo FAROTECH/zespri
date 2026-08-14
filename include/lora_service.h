@@ -4,22 +4,45 @@
 #include <SPI.h>
 #include <RadioLib.h>
 #include <LoRaWAN_ESP32.h>
+
 #include "lorawan_provisioning.h"
+
 
 class LoraService {
 public:
     bool begin(const LorawanProvisioning& cfg);
+
     bool join();
-    bool sendUplink(const uint8_t* data, size_t len, uint8_t fport = 1, bool confirmed = false);
+
+    bool sendUplink(
+        const uint8_t* data,
+        size_t len,
+        uint8_t fport = 1,
+        bool confirmed = false
+    );
 
     bool isReady() const;
     bool isJoined() const;
+
     int getLastError() const;
 
 private:
+    bool tryRestoreSession();
+
     bool persistAfterJoinOrRestore();
     bool persistAfterUplink();
-    bool tryRestoreSession();
+
+    /*
+     * Full RadioLib session persistence.
+     *
+     * LoRaWAN_ESP32 stores the session in RTC RAM, which survives
+     * deep sleep but not a normal reset/power cycle.
+     *
+     * ANDROMEDA additionally keeps the complete RadioLib session
+     * buffer in NVS.
+     */
+    bool loadFullSessionFromNvs();
+    bool saveFullSessionToNvs();
 
 private:
     SPIClass _spi = SPIClass(VSPI);
@@ -32,5 +55,6 @@ private:
 
     bool _ready = false;
     bool _joined = false;
+
     int _lastError = RADIOLIB_ERR_NONE;
 };

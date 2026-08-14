@@ -10,3 +10,8 @@ DATACAKE: https://app.datacake.de/
 fabrizio.rovelli@cshark.it
 Nessuna8!
 Token: 0b29e779f68eb87249ac0341ff001aff62096e95
+
+
+Link pubblico datacake:
+https://app.datacake.de/pd/ec3e7d31-5c2a-4cd7-b8ec-3c745ad3e89c
+

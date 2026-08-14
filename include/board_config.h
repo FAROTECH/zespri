@@ -13,7 +13,7 @@
 // Compile-time feature switches.
 // These MUST be macros because they are used with #if.
 #define ENABLE_GPS       0
-#define ENABLE_LORAWAN   0
+#define ENABLE_LORAWAN   1
 
 // Development / simulation only.
 static constexpr bool ENABLE_EXTERNAL_MOISTURE_STUB = false;
