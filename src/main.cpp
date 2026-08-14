@@ -41,7 +41,7 @@ static GpsService g_gps;
 // Runtime state
 // -----------------------------------------------------------------------------
 
-static bool g_waterAvailable = false;
+static bool g_waterInterfaceAvailable = false;
 
 static uint32_t g_lastWaterPollMs = 0;
 static uint32_t g_lastEnvSampleMs = 0;
@@ -177,10 +177,10 @@ static void printSnapshot(const DeviceSnapshot& s)
         static_cast<unsigned long>(s.uptimeMs)
     );
 
-    if (g_waterAvailable) {
+    if (g_waterInterfaceAvailable) {
 
         Serial.printf(
-            "WATER  pulses=%lu liters=%.3f line=%s lastPulseMs=%lu\n",
+            "WATER IF=OK pulses=%lu liters=%.3f line=%s lastPulseMs=%lu\n",
             static_cast<unsigned long>(s.water.pulseCount),
             s.water.liters,
             s.water.lineState ? "HIGH" : "LOW",
@@ -201,7 +201,7 @@ static void printSnapshot(const DeviceSnapshot& s)
 
     } else {
 
-        Serial.println("WATER  INVALID");
+        Serial.println("WATER IF=FAIL");
     }
 
     // -------------------------------------------------------------------------
@@ -446,7 +446,7 @@ void setup()
     // Water meter
     // -------------------------------------------------------------------------
 
-    g_waterAvailable =
+    g_waterInterfaceAvailable =
         g_waterCounter.begin(
             Wire,
             I2C_ADDR_PCF8574,
@@ -454,8 +454,8 @@ void setup()
         );
 
     Serial.printf(
-        "WATER : %s\n",
-        g_waterAvailable ? "OK" : "FAIL"
+        "WATER IF : %s\n",
+        g_waterInterfaceAvailable ? "OK" : "FAIL"
     );
 
     // -------------------------------------------------------------------------
@@ -549,13 +549,12 @@ void loop()
     // Water meter
     // -------------------------------------------------------------------------
 
-    if (g_waterAvailable &&
+    if (g_waterInterfaceAvailable &&
         (nowMs - g_lastWaterPollMs >= WATER_POLL_PERIOD_MS)) {
 
         g_lastWaterPollMs = nowMs;
         g_waterCounter.update(nowMs);
     }
-
     // -------------------------------------------------------------------------
     // Environment
     // -------------------------------------------------------------------------

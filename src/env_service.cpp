@@ -103,20 +103,31 @@ bool EnvService::begin(TwoWire& wire)
 
     } else {
 
-        _data.moisturePresent = _soil.begin(MOISTURE_I2C_ADDR);
+        /*
+        * Probe the expected I2C address before invoking the Seesaw library.
+        *
+        * Adafruit_seesaw::begin() retries internally and may repeatedly call
+        * Wire.begin() when the device is absent, producing misleading warnings.
+        */
+        if (isI2cDevicePresent(MOISTURE_I2C_ADDR)) {
 
-        if (_data.moisturePresent) {
+            _data.moisturePresent =
+                _soil.begin(MOISTURE_I2C_ADDR);
 
-            uint16_t raw = 0xFFFFU;
+            if (_data.moisturePresent) {
 
-            if (readMoisture(raw)) {
-                _data.moistureRaw = raw;
-            } else {
-                _data.moistureRaw = 0xFFFFU;
+                uint16_t raw = 0xFFFFU;
+
+                if (readMoisture(raw)) {
+                    _data.moistureRaw = raw;
+                } else {
+                    _data.moistureRaw = 0xFFFFU;
+                }
             }
 
         } else {
 
+            _data.moisturePresent = false;
             _data.moistureRaw = 0xFFFFU;
         }
     }
@@ -216,4 +227,14 @@ void EnvService::update()
 EnvData EnvService::getData() const
 {
     return _data;
+}
+
+bool EnvService::isI2cDevicePresent(uint8_t address)
+{
+    if (_wire == nullptr) {
+        return false;
+    }
+
+    _wire->beginTransmission(address);
+    return (_wire->endTransmission(true) == 0);
 }

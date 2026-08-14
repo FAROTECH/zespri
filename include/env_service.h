@@ -20,4 +20,6 @@ private:
     Adafruit_seesaw _soil;
 
     EnvData _data;
+    bool readMoisture(uint16_t& value);
+    bool isI2cDevicePresent(uint8_t address);
 };
